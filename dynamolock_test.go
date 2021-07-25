@@ -48,7 +48,7 @@ func TestBasic(t *testing.T) {
 	    t.Fatal(err)
 	}
 	id := Uid()
-	cancel, err := AcquireLock(ctx, table, id, Uid(), time.Second * 30, time.Second * 1)
+	releaseLock, err := AcquireLock(ctx, table, id, Uid(), time.Second * 30, time.Second * 1)
 	if err != nil {
 	    t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestBasic(t *testing.T) {
 	if err == nil {
 	    t.Fatal("acquired lock twice")
 	}
-	cancel()
+	releaseLock()
 }
 
 func TestReadModifyWrite(t *testing.T) {
@@ -78,7 +78,7 @@ func TestReadModifyWrite(t *testing.T) {
 	for i := 0; i < max; i++ {
 		go func() {
 			for {
-				cancel, err := AcquireLock(ctx, table, id, Uid(), time.Second*30, time.Second*1)
+				releaseLock, err := AcquireLock(ctx, table, id, Uid(), time.Second*30, time.Second*1)
 				if err != nil {
 					continue
 				}
@@ -86,7 +86,7 @@ func TestReadModifyWrite(t *testing.T) {
 				time.Sleep(time.Millisecond * 100)
 				sum = localSum + 1
 				errs <- nil
-				cancel()
+				releaseLock()
 				break
 			}
 		}()

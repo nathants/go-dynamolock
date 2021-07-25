@@ -150,11 +150,11 @@ func AcquireLock(ctx context.Context, table string, id string, uid string, maxAg
 	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	go heartbeatLock(heartbeatCtx, table, id, uid, heartbeatInterval)
-	return func() { unlock(ctx, table, id, uid, cancelHeartbeat) }, nil
+	return func() { releaseLock(ctx, table, id, uid, cancelHeartbeat) }, nil
 }
 
-func unlock(ctx context.Context, table, id, uid string, cancel func()) {
-	cancel()
+func releaseLock(ctx context.Context, table, id, uid string, cancelHearbeat func()) {
+	cancelHearbeat()
 	expr := condEqualsUid(uid)
 	lock := &Lock{
 		LockKey: LockKey{
