@@ -21,13 +21,13 @@ func main() {
 	maxAge := time.Second * 30
 	heartbeatInterval := time.Second * 1
 	releaseLock, err := dynamolock.AcquireLock(
-        ctx,
-        table,
-        lockId,
-        lockUid,
-        maxAge,
-        heartbeatInterval,
-    )
+		ctx,
+		table,
+		lockId,
+		lockUid,
+		maxAge,
+		heartbeatInterval,
+	)
 	if err != nil {
 		panic(err)
 	}
