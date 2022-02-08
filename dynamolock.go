@@ -82,7 +82,7 @@ func maybeInitLock(ctx context.Context, table, id, uid string) error {
 		})
 		if err != nil {
 			err = fmt.Errorf("failed to init-acquire the lock: %w", err)
-			lib.Logger.Print(err)
+			lib.Logger.Println("error:", err)
 			return err
 		}
 		lib.Logger.Printf("init-acquired the lock: %s %s", id, uid)
@@ -125,7 +125,7 @@ func AcquireLock(ctx context.Context, table string, id string, uid string, maxAg
 			lib.Logger.Printf("lock is expired: %s %s", id, uid)
 		} else {
 			err = fmt.Errorf("lock is held: %s %s", id, uid)
-			lib.Logger.Print(err)
+			lib.Logger.Println("error:", err)
 			return nil, err
 		}
 	}
@@ -145,7 +145,7 @@ func AcquireLock(ctx context.Context, table string, id string, uid string, maxAg
 	})
 	if err != nil {
 		err = fmt.Errorf("failed to acquire the lock: %w", err)
-		lib.Logger.Print(err)
+		lib.Logger.Println("error:", err)
 		return nil, err
 	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
