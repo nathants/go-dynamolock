@@ -85,7 +85,7 @@ func maybeInitLock(ctx context.Context, table, id, uid string) error {
 			lib.Logger.Println("error:", err)
 			return err
 		}
-		lib.Logger.Printf("init-acquired the lock: %s %s", id, uid)
+		// lib.Logger.Printf("init-acquired the lock: %s %s", id, uid)
 	}
 	return nil
 }
@@ -118,14 +118,14 @@ func AcquireLock(ctx context.Context, table string, id string, uid string, maxAg
 		}
 	}
 	if lock.Unix == 0 {
-		lib.Logger.Printf("lock is vacant: %s %s", id, uid)
+		// lib.Logger.Printf("lock is vacant: %s %s", id, uid)
 	} else {
 		age := time.Since(time.Unix(int64(lock.Unix), 0))
 		if age > maxAge {
-			lib.Logger.Printf("lock is expired: %s %s", id, uid)
+			// lib.Logger.Printf("lock is expired: %s %s", id, uid)
 		} else {
 			err = fmt.Errorf("lock is held: %s %s", id, uid)
-			lib.Logger.Println("error:", err)
+			// lib.Logger.Println("error:", err)
 			return nil, err
 		}
 	}
@@ -145,7 +145,7 @@ func AcquireLock(ctx context.Context, table string, id string, uid string, maxAg
 	})
 	if err != nil {
 		err = fmt.Errorf("failed to acquire the lock: %w", err)
-		lib.Logger.Println("error:", err)
+		// lib.Logger.Println("error:", err)
 		return nil, err
 	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
@@ -181,7 +181,7 @@ func releaseLock(ctx context.Context, table, id, uid string, cancelHearbeat func
 		lib.Logger.Printf("failed to release the lock: %s %s %s", id, uid, err)
 		return
 	}
-	lib.Logger.Printf("released the lock: %s %s", id, uid)
+	// lib.Logger.Printf("released the lock: %s %s", id, uid)
 }
 
 func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval time.Duration) {
@@ -193,7 +193,7 @@ func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval
 		select {
 		case <-time.After(heartbeatInterval):
 		case <-ctx.Done():
-			lib.Logger.Printf("stop the heartbeat: %s %s", id, uid)
+			// lib.Logger.Printf("stop the heartbeat: %s %s", id, uid)
 			return
 		}
 		expr := condEqualsUid(lock.Uid)
@@ -217,6 +217,6 @@ func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval
 				panic("failed to heartbeat the lock")
 			}
 		}
-		lib.Logger.Printf("heartbeat: %s %s", id, uid)
+		// lib.Logger.Printf("heartbeat: %s %s", id, uid)
 	}
 }
