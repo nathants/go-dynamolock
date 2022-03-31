@@ -1,18 +1,18 @@
 package dynamolock
 
 import (
-	"time"
 	"context"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/gofrs/uuid"
 	"github.com/nathants/cli-aws/lib"
-	"github.com/satori/go.uuid"
 )
 
 func Uid() string {
-	return uuid.NewV4().String()
+	return uuid.Must(uuid.NewV4()).String()
 }
 
 func EnsureTable(table string) error {
@@ -37,36 +37,36 @@ func EnsureTable(table string) error {
 
 func TestBasic(t *testing.T) {
 	ctx := context.Background()
-	table := "test-go-dynamolock-" + uuid.NewV4().String()
+	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
 	err := EnsureTable(table)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table) }()
+	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table, false) }()
 	err = lib.DynamoDBWaitForReady(ctx, table)
 	if err != nil {
-	    t.Fatal(err)
+		t.Fatal(err)
 	}
 	id := Uid()
-	releaseLock, err := AcquireLock(ctx, table, id, Uid(), time.Second * 30, time.Second * 1)
+	releaseLock, err := AcquireLock(ctx, table, id, Uid(), time.Second*30, time.Second*1)
 	if err != nil {
-	    t.Fatal(err)
+		t.Fatal(err)
 	}
-	_, err = AcquireLock(ctx, table, id, Uid(), time.Second * 30, time.Second * 1)
+	_, err = AcquireLock(ctx, table, id, Uid(), time.Second*30, time.Second*1)
 	if err == nil {
-	    t.Fatal("acquired lock twice")
+		t.Fatal("acquired lock twice")
 	}
 	releaseLock()
 }
 
 func TestReadModifyWrite(t *testing.T) {
 	ctx := context.Background()
-	table := "test-go-dynamolock-" + uuid.NewV4().String()
+	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
 	err := EnsureTable(table)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table) }()
+	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table, false) }()
 	err = lib.DynamoDBWaitForReady(ctx, table)
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +94,7 @@ func TestReadModifyWrite(t *testing.T) {
 	for i := 0; i < max; i++ {
 		err := <-errs
 		if err != nil {
-		    t.Fatal(err)
+			t.Fatal(err)
 		}
 	}
 	if sum != max {

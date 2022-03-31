@@ -9,7 +9,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/satori/go.uuid"
+	"github.com/gofrs/uuid"
 	"github.com/nathants/go-dynamolock"
 )
 
@@ -17,7 +17,7 @@ func main() {
 	ctx := context.Background()
 	table := "a-table-name"
 	lockId := "a-lock-name"
-	lockUid := uuid.NewV4().String()
+	lockUid := uuid.Must(uuid.NewV4()).String()
 	maxAge := time.Second * 30
 	heartbeatInterval := time.Second * 1
 	releaseLock, err := dynamolock.AcquireLock(
