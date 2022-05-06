@@ -3,6 +3,7 @@ package dynamolock
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -185,6 +186,15 @@ func releaseLock(ctx context.Context, table, id, uid string, cancelHearbeat func
 }
 
 func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := string(debug.Stack())
+			lib.Logger.Println(r)
+			lib.Logger.Println(stack)
+			lib.Logger.Flush()
+			panic(r)
+		}
+	}()
 	lock := Lock{
 		LockKey:  LockKey{ID: id},
 		LockData: LockData{Uid: uid},

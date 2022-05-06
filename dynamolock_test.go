@@ -77,6 +77,7 @@ func TestReadModifyWrite(t *testing.T) {
 	errs := make(chan error)
 	for i := 0; i < max; i++ {
 		go func() {
+			// defer func() {}()
 			for {
 				releaseLock, err := AcquireLock(ctx, table, id, Uid(), time.Second*30, time.Second*1)
 				if err != nil {
