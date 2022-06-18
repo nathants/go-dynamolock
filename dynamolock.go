@@ -83,7 +83,6 @@ func maybeInitLock(ctx context.Context, table, id, uid string) error {
 		})
 		if err != nil {
 			err = fmt.Errorf("failed to init-acquire the lock: %w", err)
-			lib.Logger.Println("error:", err)
 			return err
 		}
 		// lib.Logger.Printf("init-acquired the lock: %s %s", id, uid)
@@ -126,7 +125,6 @@ func AcquireLock(ctx context.Context, table string, id string, uid string, maxAg
 			// lib.Logger.Printf("lock is expired: %s %s", id, uid)
 		} else {
 			err = fmt.Errorf("lock is held: %s %s", id, uid)
-			// lib.Logger.Println("error:", err)
 			return nil, err
 		}
 	}
@@ -146,7 +144,6 @@ func AcquireLock(ctx context.Context, table string, id string, uid string, maxAg
 	})
 	if err != nil {
 		err = fmt.Errorf("failed to acquire the lock: %w", err)
-		// lib.Logger.Println("error:", err)
 		return nil, err
 	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
@@ -210,7 +207,7 @@ func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval
 		lock.Unix = int(time.Now().Unix())
 		item, err := dynamodbattribute.MarshalMap(lock)
 		if err != nil {
-			panic("failed to heartbeat the lock")
+			panic("failed to heartbeat the lock: " + err.Error())
 		}
 		_, err = lib.DynamoDBClient().PutItemWithContext(ctx, &dynamodb.PutItemInput{
 			Item:                      item,
@@ -224,7 +221,7 @@ func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval
 			case <-ctx.Done():
 				return
 			default:
-				panic("failed to heartbeat the lock")
+				panic("failed to heartbeat the lock: " + err.Error())
 			}
 		}
 		// lib.Logger.Printf("heartbeat: %s %s", id, uid)
