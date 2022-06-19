@@ -2,6 +2,7 @@ package dynamolock
 
 import (
 	"context"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -72,33 +73,30 @@ func TestReadModifyWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Uid()
-	sum := 0
-	max := 10
-	errs := make(chan error)
+	sum := map[string]int{"sum": 0}
+	max := 250
+	done := make(chan error)
 	for i := 0; i < max; i++ {
 		go func() {
 			// defer func() {}()
 			for {
 				releaseLock, err := AcquireLock(ctx, table, id, Uid(), time.Second*30, time.Second*1)
+				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 				if err != nil {
 					continue
 				}
-				localSum := sum
-				time.Sleep(time.Millisecond * 100)
-				sum = localSum + 1
-				errs <- nil
+				sum["sum"]++
+				done <- nil
+				lib.Logger.Println("releasing lock, sum:", sum)
 				releaseLock()
 				break
 			}
 		}()
 	}
 	for i := 0; i < max; i++ {
-		err := <-errs
-		if err != nil {
-			t.Fatal(err)
-		}
+		<-done
 	}
-	if sum != max {
-		t.Errorf("expected %d, got %d", max, sum)
+	if sum["sum"] != max {
+		t.Errorf("expected %d, got %d", max, sum["sum"])
 	}
 }
