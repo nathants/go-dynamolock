@@ -52,37 +52,37 @@ type Data struct {
 func main() {
 	ctx := context.Background()
 
-    // dynamodb table
+	// dynamodb table
 	table := "table"
 
-    // dynamodb key
+	// dynamodb key
 	id := "lock1"
 
-    // after a failure to unlock/heartbeat, this much time must pass before lock is available
+	// after a failure to unlock/heartbeat, this much time must pass before lock is available
 	maxAge := time.Second * 30
 
-    // how often to heartbeat lock timestamp
+	// how often to heartbeat lock timestamp
 	heartbeat := time.Second * 1
 
-    // lock and fetch data
+	// lock and fetch data
 	unlock, item, err := dynamolock.Lock(ctx, table, id, maxAge, heartbeat)
 	if err != nil {
-        // TODO handle lock contention
+		// TODO handle lock contention
 		panic(err)
 	}
-    data := &Data{}
+	data := &Data{}
 	err = dynamodbattribute.UnmarshalMap(item, data)
 	if err != nil {
 		panic(err)
 	}
 
-    // do work with the lock
+	// do work with the lock
 	time.Sleep(time.Second * 1)
 
-    // data will be compare-and-swapped on unlock
-    data.Value = "updated"
+	// data will be compare-and-swapped on unlock
+	data.Value = "updated"
 
-    // unlock and update data
+	// unlock and update data
 	item, err = dynamodbattribute.MarshalMap(data)
 	if err != nil {
 		panic(err)
@@ -92,4 +92,5 @@ func main() {
 		panic(err)
 	}
 }
+
 ```
