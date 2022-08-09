@@ -64,7 +64,7 @@ func main() {
 	// how often to heartbeat lock timestamp
 	heartbeat := time.Second * 1
 
-	// lock and fetch data
+	// lock and read data
 	unlock, item, err := dynamolock.Lock(ctx, table, id, maxAge, heartbeat)
 	if err != nil {
 		// TODO handle lock contention
@@ -78,11 +78,9 @@ func main() {
 
 	// do work with the lock
 	time.Sleep(time.Second * 1)
-
-	// data will be compare-and-swapped on unlock
 	data.Value = "updated"
 
-	// unlock and update data
+	// unlock and write data
 	item, err = dynamodbattribute.MarshalMap(data)
 	if err != nil {
 		panic(err)
