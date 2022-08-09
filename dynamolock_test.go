@@ -37,6 +37,35 @@ func EnsureTable(table string) error {
 	)
 }
 
+func TestLockExpiration(t *testing.T) {
+	ctx := context.Background()
+	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
+	err := EnsureTable(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table, false) }()
+	err = lib.DynamoDBWaitForReady(ctx, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Uid()
+	unlockA, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	unlockB, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = unlockB(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unlockA(nil) // stop goroutine heartbeating to avoid panic on table cleanup
+}
+
 func TestBasic(t *testing.T) {
 	ctx := context.Background()
 	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()

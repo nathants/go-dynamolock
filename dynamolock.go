@@ -83,7 +83,7 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 	}
 	condition := expression.Name("uid").AttributeNotExists() // first put to a key uses this condition
 	if len(out.Item) != 0 {
-		condition = expression.Name("uid").Equal(expression.Value("")) // all other puts to a key use this condition
+		condition = expression.Name("uid").Equal(expression.Value(lock.Uid)) // all other puts to a key use this condition
 	}
 	expr, err := expression.NewBuilder().
 		WithCondition(condition).
