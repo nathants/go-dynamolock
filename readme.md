@@ -24,7 +24,7 @@ arbitrary data can be stored atomically in the lock record. it is read via lock,
 
 manipulation of external state while the lock is held is subject to concurrent updates depending on maxAge, heartbeatInterval, and caller clock drift.
 
-in practice, a small heartbeatInterval, a large maxAge, and reasonable clock drift should be safe.
+in practice, a small heartbeatInterval, a large maxAge, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
 
 prefer to store data within the lock when possible.
 
