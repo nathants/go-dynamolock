@@ -28,11 +28,11 @@ type LockRecord struct {
 	LockData
 }
 
-type dynamoMap map[string]*dynamodb.AttributeValue
+type DynamoMap map[string]*dynamodb.AttributeValue
 
-type unlockFn func(dynamoMap) error
+type UnlockFn func(DynamoMap) error
 
-func Read(ctx context.Context, table, id string) (dynamoMap, error) {
+func Read(ctx context.Context, table, id string) (DynamoMap, error) {
 	key, err := dynamodbattribute.MarshalMap(LockKey{ID: id})
 	if err != nil {
 		return nil, err
@@ -48,7 +48,7 @@ func Read(ctx context.Context, table, id string) (dynamoMap, error) {
 	return out.Item, nil
 }
 
-func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.Duration) (unlockFn, dynamoMap, error) {
+func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.Duration) (UnlockFn, DynamoMap, error) {
 	uid := uuid.Must(uuid.NewV4()).String()
 	lockKey := LockKey{ID: id}
 	key, err := dynamodbattribute.MarshalMap(lockKey)
@@ -107,11 +107,11 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	go heartbeatLock(heartbeatCtx, table, id, uid, heartbeatInterval)
-	unlock := func(data dynamoMap) error { return releaseLock(ctx, table, id, uid, data, cancelHeartbeat) }
+	unlock := func(data DynamoMap) error { return releaseLock(ctx, table, id, uid, data, cancelHeartbeat) }
 	return unlock, out.Item, nil
 }
 
-func releaseLock(ctx context.Context, table, id, uid string, data dynamoMap, cancelHearbeat func()) error {
+func releaseLock(ctx context.Context, table, id, uid string, data DynamoMap, cancelHearbeat func()) error {
 	cancelHearbeat()
 	expr, err := expression.NewBuilder().
 		WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
