@@ -32,6 +32,12 @@ type DynamoMap map[string]*dynamodb.AttributeValue
 
 type UnlockFn func(DynamoMap) error
 
+func clearInternalKeys(data DynamoMap) {
+	delete(data, "id")
+	delete(data, "uid")
+	delete(data, "unix")
+}
+
 func Read(ctx context.Context, table, id string) (DynamoMap, error) {
 	key, err := dynamodbattribute.MarshalMap(LockKey{ID: id})
 	if err != nil {
@@ -45,6 +51,7 @@ func Read(ctx context.Context, table, id string) (DynamoMap, error) {
 	if err != nil {
 		return nil, err
 	}
+	clearInternalKeys(out.Item)
 	return out.Item, nil
 }
 
@@ -108,6 +115,7 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	go heartbeatLock(heartbeatCtx, table, id, uid, heartbeatInterval)
 	unlock := func(data DynamoMap) error { return releaseLock(ctx, table, id, uid, data, cancelHeartbeat) }
+	clearInternalKeys(out.Item)
 	return unlock, out.Item, nil
 }
 
