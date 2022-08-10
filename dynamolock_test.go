@@ -165,6 +165,20 @@ func TestData(t *testing.T) {
 		t.Fatal("die2")
 	}
 
+	// read data without locking
+	item, err = Read(ctx, table, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = &testData{}
+	err = dynamodbattribute.UnmarshalMap(item, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Value != "asdf" {
+		t.Fatal("die2")
+	}
+
 	// unlock, wiping data
 	err = unlock(nil)
 	if err != nil {

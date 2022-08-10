@@ -32,6 +32,22 @@ type dynamoMap map[string]*dynamodb.AttributeValue
 
 type unlockFn func(dynamoMap) error
 
+func Read(ctx context.Context, table, id string) (dynamoMap, error) {
+	key, err := dynamodbattribute.MarshalMap(LockKey{ID: id})
+	if err != nil {
+		return nil, err
+	}
+	out, err := lib.DynamoDBClient().GetItemWithContext(ctx, &dynamodb.GetItemInput{
+		ConsistentRead: aws.Bool(true),
+		TableName:      aws.String(table),
+		Key:            key,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Item, nil
+}
+
 func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.Duration) (unlockFn, dynamoMap, error) {
 	uid := uuid.Must(uuid.NewV4()).String()
 	lockKey := LockKey{ID: id}
