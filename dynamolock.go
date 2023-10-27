@@ -119,8 +119,8 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 	return unlock, out.Item, nil
 }
 
-func releaseLock(ctx context.Context, table, id, uid string, data DynamoMap, cancelHearbeat func()) error {
-	cancelHearbeat()
+func releaseLock(ctx context.Context, table, id, uid string, data DynamoMap, cancelHeartbeat func()) error {
+	cancelHeartbeat()
 	expr, err := expression.NewBuilder().
 		WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
 		Build()
