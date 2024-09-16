@@ -19,7 +19,7 @@ type LockKey struct {
 }
 
 type LockData struct {
-	Unix int    `json:"unix"` // timestamp of lock holder
+	Unix int64  `json:"unix"` // timestamp of lock holder
 	Uid  string `json:"uid"`  // uuid of lock holder
 }
 
@@ -96,7 +96,7 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 		WithCondition(condition).
 		WithUpdate(expression.
 			Set(expression.Name("uid"), expression.Value(uid)).
-			Set(expression.Name("unix"), expression.Value(int(time.Now().Unix())))).
+			Set(expression.Name("unix"), expression.Value(time.Now().Unix()))).
 		Build()
 	if err != nil {
 		return nil, nil, err
