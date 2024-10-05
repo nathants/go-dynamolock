@@ -154,7 +154,6 @@ func TestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Uid()
-
 	// lock, new id means empty data
 	data := &testData{}
 	unlock, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
@@ -168,7 +167,6 @@ func TestData(t *testing.T) {
 	if data.Value != "" {
 		t.Fatal("die1")
 	}
-
 	// unlock, passing data
 	data = &testData{Value: "asdf"}
 	item, err = dynamodbattribute.MarshalMap(data)
@@ -179,7 +177,6 @@ func TestData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	// lock, data not empty
 	unlock, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
@@ -193,7 +190,6 @@ func TestData(t *testing.T) {
 	if data.Value != "asdf" {
 		t.Fatal("die2")
 	}
-
 	// read data without locking
 	item, err = Read(ctx, table, id)
 	if err != nil {
@@ -207,13 +203,11 @@ func TestData(t *testing.T) {
 	if data.Value != "asdf" {
 		t.Fatal("die2")
 	}
-
 	// unlock, wiping data
 	err = unlock(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	// lock, data empty
 	unlock, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
@@ -227,11 +221,64 @@ func TestData(t *testing.T) {
 	if data.Value != "" {
 		t.Fatal("die3")
 	}
-
 	// unlock
 	err = unlock(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+}
 
+type preExistingData struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+	// note you cannot use "uid" or "unix", since those are part of LockData{}
+}
+
+func TestPreExistingData(t *testing.T) {
+	ctx := context.Background()
+	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
+	err := EnsureTable(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table, false) }()
+	err = lib.DynamoDBWaitForReady(ctx, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := dynamodbattribute.MarshalMap(preExistingData{
+		ID: "test-id",
+		Value: "test-value",
+	})
+	if err != nil {
+	    panic(err)
+	}
+	_, err = lib.DynamoDBClient().PutItemWithContext(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item: item,
+	})
+	if err != nil {
+	    panic(err)
+	}
+	id := "test-id"
+	unlock, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := preExistingData{}
+	err = dynamodbattribute.UnmarshalMap(item, &data)
+	if err != nil {
+	    panic(err)
+	}
+	if data.Value != "test-value" {
+		t.Fatal("wrong value")
+	}
+	_, _, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
+	if err == nil {
+		t.Fatal("acquired lock twice")
+	}
+	err = unlock(item)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
