@@ -5,7 +5,7 @@ go 1.22
 require (
 	github.com/aws/aws-sdk-go v1.55.5
 	github.com/gofrs/uuid v4.4.0+incompatible
-	github.com/nathants/libaws v0.0.0-20240912101823-f5ccb8736be3
+	github.com/nathants/libaws v0.0.0-20240921020425-affb1d600225
 )
 
 require (

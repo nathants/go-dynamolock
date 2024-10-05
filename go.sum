@@ -22,8 +22,8 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/mikesmitty/edkey v0.0.0-20170222072505-3356ea4e686a h1:eU8j/ClY2Ty3qdHnn0TyW3ivFoPC/0F1gQZz8yTxbbE=
 github.com/mikesmitty/edkey v0.0.0-20170222072505-3356ea4e686a/go.mod h1:v8eSC2SMp9/7FTKUncp7fH9IwPfw+ysMObcEz5FWheQ=
-github.com/nathants/libaws v0.0.0-20240912101823-f5ccb8736be3 h1:UcMsBd7S069+J/gcZZGQOf/h/bkOJ8cDqcYVR7ygE/o=
-github.com/nathants/libaws v0.0.0-20240912101823-f5ccb8736be3/go.mod h1:nKiG4K1OLCYLJqZVOSlNzpfTAHTcBDDuY7eA0ml6bTw=
+github.com/nathants/libaws v0.0.0-20240921020425-affb1d600225 h1:cxwk4UXMNgUB8Oibis5wIc6o+OTuEbOm0XNhMKSvNFU=
+github.com/nathants/libaws v0.0.0-20240921020425-affb1d600225/go.mod h1:nKiG4K1OLCYLJqZVOSlNzpfTAHTcBDDuY7eA0ml6bTw=
 github.com/pkg/term v1.1.0 h1:xIAAdCMh3QIAy+5FrE8Ad8XoDhEU4ufwbaSozViP9kk=
 github.com/pkg/term v1.1.0/go.mod h1:E25nymQcrSllhX42Ok8MRm1+hyBdHY0dCeiKZ9jpNGw=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
