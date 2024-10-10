@@ -22,13 +22,13 @@ while locked, the caller heartbeats the timestamp.
 
 to unlock, the caller removes the uuid.
 
-arbitrary data can be stored atomically in the lock record. it is read via lock, and written via unlock.
+arbitrary data can be stored atomically in the lock record. it is read via lock, written via unlock, and can be written without unlocking via update.
 
 manipulation of external state while the lock is held is subject to concurrent updates depending on maxAge, heartbeatInterval, and caller clock drift.
 
 in practice, a small heartbeatInterval, a large maxAge, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
 
-prefer to store data within the lock when possible.
+prefer to store data within the lock when possible, since those updates compare and swap with the uuid.
 
 ## install
 
@@ -67,7 +67,7 @@ func main() {
 	heartbeat := time.Second * 1
 
 	// lock and read data
-	unlock, item, err := dynamolock.Lock(ctx, table, id, maxAge, heartbeat)
+	unlock, _, item, err := dynamolock.Lock(ctx, table, id, maxAge, heartbeat)
 	if err != nil {
 		// TODO handle lock contention
 		panic(err)

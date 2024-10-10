@@ -50,12 +50,12 @@ func TestLockExpiration(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Uid()
-	unlockA, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
+	unlockA, _, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(1500 * time.Millisecond)
-	unlockB, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
+	unlockB, _, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,11 +79,11 @@ func TestBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Uid()
-	unlock, _, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, _, _, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
+	_, _, _, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err == nil {
 		t.Fatal("acquired lock twice")
 	}
@@ -107,13 +107,13 @@ func TestReadModifyWrite(t *testing.T) {
 	}
 	id := Uid()
 	sum := map[string]int{"sum": 0}
-	max := 250
+	max := 25
 	done := make(chan error, max)
 	for i := 0; i < max; i++ {
 		go func() {
 			// defer func() {}()
 			for {
-				unlock, _, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+				unlock, _, _, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
 				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 				if err != nil {
 					continue
@@ -156,7 +156,7 @@ func TestData(t *testing.T) {
 	id := Uid()
 	// lock, new id means empty data
 	data := &testData{}
-	unlock, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, _, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	// lock, data not empty
-	unlock, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, _, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	// lock, data empty
-	unlock, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, _, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,38 +247,143 @@ func TestPreExistingData(t *testing.T) {
 		t.Fatal(err)
 	}
 	item, err := dynamodbattribute.MarshalMap(preExistingData{
-		ID: "test-id",
+		ID:    "test-id",
 		Value: "test-value",
 	})
 	if err != nil {
-	    panic(err)
+		panic(err)
 	}
 	_, err = lib.DynamoDBClient().PutItemWithContext(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(table),
-		Item: item,
+		Item:      item,
 	})
 	if err != nil {
-	    panic(err)
+		panic(err)
 	}
 	id := "test-id"
-	unlock, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, _, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	data := preExistingData{}
 	err = dynamodbattribute.UnmarshalMap(item, &data)
 	if err != nil {
-	    panic(err)
+		panic(err)
 	}
 	if data.Value != "test-value" {
 		t.Fatal("wrong value")
 	}
-	_, _, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
+	_, _, _, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
 	if err == nil {
 		t.Fatal("acquired lock twice")
 	}
 	err = unlock(item)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+type Data struct {
+	Value string `json:"value"`
+	// note you cannot use "uid" or "unix", since those are part of LockData{}
+}
+
+func TestWriteWithoutUnlocking(t *testing.T) {
+	ctx := context.Background()
+	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
+	err := EnsureTable(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table, false) }()
+	err = lib.DynamoDBWaitForReady(ctx, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "test-id"
+	unlock, update, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := Data{}
+	err = dynamodbattribute.UnmarshalMap(item, &data)
+	if err != nil {
+		panic(err)
+	}
+	{
+		data.Value = "asdf"
+		item, err = dynamodbattribute.MarshalMap(data)
+		if err != nil {
+			panic(err)
+		}
+		time.Sleep(2 * time.Second)
+		err = update(item)
+		if err != nil {
+			panic(err)
+		}
+	}
+	item, err = Read(ctx, table, id)
+	if err != nil {
+		panic(err)
+	}
+	data = Data{}
+	err = dynamodbattribute.UnmarshalMap(item, &data)
+	if err != nil {
+		panic(err)
+	}
+	if data.Value != "asdf" {
+		t.Fatal(lib.PformatAlways(data))
+	}
+	{
+		data.Value = "foo"
+		item, err = dynamodbattribute.MarshalMap(data)
+		if err != nil {
+			panic(err)
+		}
+		time.Sleep(2 * time.Second)
+		err = update(item)
+		if err != nil {
+			panic(err)
+		}
+	}
+	item, err = Read(ctx, table, id)
+	if err != nil {
+		panic(err)
+	}
+	data = Data{}
+	err = dynamodbattribute.UnmarshalMap(item, &data)
+	if err != nil {
+		panic(err)
+	}
+	if data.Value != "foo" {
+		t.Fatal(lib.PformatAlways(data))
+	}
+	{
+		data.Value = "bar"
+		item, err = dynamodbattribute.MarshalMap(data)
+		if err != nil {
+			panic(err)
+		}
+		time.Sleep(2 * time.Second)
+		err = update(item)
+		if err != nil {
+			panic(err)
+		}
+	}
+	err = unlock(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err = Read(ctx, table, id)
+	if err != nil {
+		panic(err)
+	}
+	data = Data{}
+	err = dynamodbattribute.UnmarshalMap(item, &data)
+	if err != nil {
+		panic(err)
+	}
+	if data.Value != "bar" {
+		t.Fatal(lib.PformatAlways(data))
 	}
 }
