@@ -13,6 +13,11 @@ import (
 	"github.com/nathants/libaws/lib"
 )
 
+type Data struct {
+	Value string `json:"value"`
+	// note you cannot use "uid" or "unix", since those are part of LockData{}
+}
+
 func Uid() string {
 	return uuid.Must(uuid.NewV4()).String()
 }
@@ -50,20 +55,20 @@ func TestLockExpiration(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Uid()
-	unlockA, _, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
+	unlockA, _, dataA, err := Lock[Data](ctx, table, id, time.Second*1, time.Second*10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(1500 * time.Millisecond)
-	unlockB, _, _, err := Lock(ctx, table, id, time.Second*1, time.Second*10)
+	unlockB, _, dataB, err := Lock[Data](ctx, table, id, time.Second*1, time.Second*10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = unlockB(nil)
+	err = unlockB(dataB)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = unlockA(nil) // stop goroutine heartbeating to avoid panic on table cleanup
+	_ = unlockA(dataA) // stop goroutine heartbeating to avoid panic on table cleanup
 }
 
 func TestBasic(t *testing.T) {
@@ -79,15 +84,15 @@ func TestBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Uid()
-	unlock, _, _, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, _, data, err := Lock[Data](ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
+	_, _, _, err = Lock[Data](ctx, table, id, time.Second*30, time.Second*1)
 	if err == nil {
 		t.Fatal("acquired lock twice")
 	}
-	err = unlock(nil)
+	err = unlock(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +118,7 @@ func TestReadModifyWrite(t *testing.T) {
 		go func() {
 			// defer func() {}()
 			for {
-				unlock, _, _, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+				unlock, _, data, err := Lock[Data](ctx, table, id, time.Second*30, time.Second*1)
 				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 				if err != nil {
 					continue
@@ -121,7 +126,7 @@ func TestReadModifyWrite(t *testing.T) {
 				sum["sum"]++
 				done <- nil
 				lib.Logger.Println("releasing lock, sum:", sum)
-				err = unlock(nil)
+				err = unlock(data)
 				if err != nil {
 					panic(err)
 				}
@@ -155,12 +160,7 @@ func TestData(t *testing.T) {
 	}
 	id := Uid()
 	// lock, new id means empty data
-	data := &testData{}
-	unlock, _, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = dynamodbattribute.UnmarshalMap(item, data)
+	unlock, _, data, err := Lock[testData](ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,22 +168,12 @@ func TestData(t *testing.T) {
 		t.Fatal("die1")
 	}
 	// unlock, passing data
-	data = &testData{Value: "asdf"}
-	item, err = dynamodbattribute.MarshalMap(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = unlock(item)
+	err = unlock(testData{Value: "asdf"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// lock, data not empty
-	unlock, _, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = &testData{}
-	err = dynamodbattribute.UnmarshalMap(item, data)
+	unlock, _, data, err = Lock[testData](ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,12 +181,7 @@ func TestData(t *testing.T) {
 		t.Fatal("die2")
 	}
 	// read data without locking
-	item, err = Read(ctx, table, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = &testData{}
-	err = dynamodbattribute.UnmarshalMap(item, data)
+	data, err = Read[testData](ctx, table, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,17 +189,12 @@ func TestData(t *testing.T) {
 		t.Fatal("die2")
 	}
 	// unlock, wiping data
-	err = unlock(nil)
+	err = unlock(testData{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// lock, data empty
-	unlock, _, item, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = &testData{}
-	err = dynamodbattribute.UnmarshalMap(item, data)
+	unlock, _, data, err = Lock[testData](ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +202,7 @@ func TestData(t *testing.T) {
 		t.Fatal("die3")
 	}
 	// unlock
-	err = unlock(nil)
+	err = unlock(data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,31 +241,21 @@ func TestPreExistingData(t *testing.T) {
 		panic(err)
 	}
 	id := "test-id"
-	unlock, _, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, _, data, err := Lock[Data](ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
-	}
-	data := preExistingData{}
-	err = dynamodbattribute.UnmarshalMap(item, &data)
-	if err != nil {
-		panic(err)
 	}
 	if data.Value != "test-value" {
 		t.Fatal("wrong value")
 	}
-	_, _, _, err = Lock(ctx, table, id, time.Second*30, time.Second*1)
+	_, _, data, err = Lock[Data](ctx, table, id, time.Second*30, time.Second*1)
 	if err == nil {
 		t.Fatal("acquired lock twice")
 	}
-	err = unlock(item)
+	err = unlock(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-}
-
-type Data struct {
-	Value string `json:"value"`
-	// note you cannot use "uid" or "unix", since those are part of LockData{}
 }
 
 func TestWriteWithoutUnlocking(t *testing.T) {
@@ -301,33 +271,19 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := "test-id"
-	unlock, update, item, err := Lock(ctx, table, id, time.Second*30, time.Second*1)
+	unlock, update, data, err := Lock[Data](ctx, table, id, time.Second*30, time.Second*1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := Data{}
-	err = dynamodbattribute.UnmarshalMap(item, &data)
-	if err != nil {
-		panic(err)
-	}
 	{
 		data.Value = "asdf"
-		item, err = dynamodbattribute.MarshalMap(data)
-		if err != nil {
-			panic(err)
-		}
 		time.Sleep(2 * time.Second)
-		err = update(item)
+		err = update(data)
 		if err != nil {
 			panic(err)
 		}
 	}
-	item, err = Read(ctx, table, id)
-	if err != nil {
-		panic(err)
-	}
-	data = Data{}
-	err = dynamodbattribute.UnmarshalMap(item, &data)
+	data, err = Read[Data](ctx, table, id)
 	if err != nil {
 		panic(err)
 	}
@@ -336,22 +292,13 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	}
 	{
 		data.Value = "foo"
-		item, err = dynamodbattribute.MarshalMap(data)
-		if err != nil {
-			panic(err)
-		}
 		time.Sleep(2 * time.Second)
-		err = update(item)
+		err = update(data)
 		if err != nil {
 			panic(err)
 		}
 	}
-	item, err = Read(ctx, table, id)
-	if err != nil {
-		panic(err)
-	}
-	data = Data{}
-	err = dynamodbattribute.UnmarshalMap(item, &data)
+	data, err = Read[Data](ctx, table, id)
 	if err != nil {
 		panic(err)
 	}
@@ -360,26 +307,17 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	}
 	{
 		data.Value = "bar"
-		item, err = dynamodbattribute.MarshalMap(data)
-		if err != nil {
-			panic(err)
-		}
 		time.Sleep(2 * time.Second)
-		err = update(item)
+		err = update(data)
 		if err != nil {
 			panic(err)
 		}
 	}
-	err = unlock(item)
+	err = unlock(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err = Read(ctx, table, id)
-	if err != nil {
-		panic(err)
-	}
-	data = Data{}
-	err = dynamodbattribute.UnmarshalMap(item, &data)
+	data, err = Read[Data](ctx, table, id)
 	if err != nil {
 		panic(err)
 	}

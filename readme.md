@@ -67,14 +67,9 @@ func main() {
 	heartbeat := time.Second * 1
 
 	// lock and read data
-	unlock, _, item, err := dynamolock.Lock(ctx, table, id, maxAge, heartbeat)
+	unlock, _, data, err := dynamolock.Lock[Data](ctx, table, id, maxAge, heartbeat)
 	if err != nil {
 		// TODO handle lock contention
-		panic(err)
-	}
-	data := &Data{}
-	err = dynamodbattribute.UnmarshalMap(item, data)
-	if err != nil {
 		panic(err)
 	}
 
@@ -83,11 +78,7 @@ func main() {
 	data.Value = "updated"
 
 	// unlock and write data
-	item, err = dynamodbattribute.MarshalMap(data)
-	if err != nil {
-		panic(err)
-	}
-	err = unlock(item)
+	err = unlock(data)
 	if err != nil {
 		panic(err)
 	}

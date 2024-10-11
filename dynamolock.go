@@ -28,22 +28,21 @@ type LockRecord struct {
 	LockData
 }
 
-type DynamoMap map[string]*dynamodb.AttributeValue
+type UnlockFn[T any] func(T) error
 
-type UnlockFn func(DynamoMap) error
+type UpdateFn[T any] func(T) error
 
-type UpdateFn func(DynamoMap) error
-
-func clearInternalKeys(data DynamoMap) {
+func clearInternalKeys(data map[string]*dynamodb.AttributeValue) {
 	delete(data, "id")
 	delete(data, "uid")
 	delete(data, "unix")
 }
 
-func Read(ctx context.Context, table, id string) (DynamoMap, error) {
+func Read[T any](ctx context.Context, table, id string) (T, error) {
+	var val T
 	key, err := dynamodbattribute.MarshalMap(LockKey{ID: id})
 	if err != nil {
-		return nil, err
+		return val, err
 	}
 	out, err := lib.DynamoDBClient().GetItemWithContext(ctx, &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(true),
@@ -51,18 +50,23 @@ func Read(ctx context.Context, table, id string) (DynamoMap, error) {
 		Key:            key,
 	})
 	if err != nil {
-		return nil, err
+		return val, err
 	}
 	clearInternalKeys(out.Item)
-	return out.Item, nil
+	err = dynamodbattribute.UnmarshalMap(out.Item, &val)
+	if err != nil {
+	    return val, err
+	}
+	return val, nil
 }
 
-func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.Duration) (UnlockFn, UpdateFn, DynamoMap, error) {
+func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterval time.Duration) (UnlockFn[T], UpdateFn[T], T, error) {
+	var val T
 	uid := uuid.Must(uuid.NewV4()).String()
 	lockKey := LockKey{ID: id}
 	key, err := dynamodbattribute.MarshalMap(lockKey)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, val, err
 	}
 	out, err := lib.DynamoDBClient().GetItemWithContext(ctx, &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(true),
@@ -70,13 +74,13 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 		Key:            key,
 	})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, val, err
 	}
 	lock := &LockData{}
 	if len(out.Item) != 0 {
 		err = dynamodbattribute.UnmarshalMap(out.Item, &lock)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, val, err
 		}
 	}
 	if lock.Unix == 0 {
@@ -87,7 +91,7 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 			// lib.Logger.Printf("lock is expired: %s %s\n", id, uid)
 		} else {
 			err = fmt.Errorf("lock is held: %s %s", id, uid)
-			return nil, nil, nil, err
+			return nil, nil, val, err
 		}
 	}
 	condition := expression.Name("uid").AttributeNotExists() // first put to a key uses this condition
@@ -102,7 +106,7 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 			Set(expression.Name("unix"), expression.Value(time.Now().Unix()))).
 		Build()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, val, err
 	}
 	_, err = lib.DynamoDBClient().UpdateItemWithContext(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(table),
@@ -113,21 +117,25 @@ func Lock(ctx context.Context, table, id string, maxAge, heartbeatInterval time.
 		ExpressionAttributeNames:  expr.Names(),
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to acquire the lock: %w", err)
+		return nil, nil, val, fmt.Errorf("failed to acquire the lock: %w", err)
 	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	go heartbeatLock(heartbeatCtx, table, id, uid, heartbeatInterval)
-	unlock := func(data DynamoMap) error {
+	unlock := func(data T) error {
 		return releaseLock(ctx, table, id, uid, data, cancelHeartbeat)
 	}
-	update := func(data DynamoMap) error {
+	update := func(data T) error {
 		return updateLocked(ctx, table, id, uid, data)
 	}
 	clearInternalKeys(out.Item)
-	return unlock, update, out.Item, nil
+	err = dynamodbattribute.UnmarshalMap(out.Item, &val)
+	if err != nil {
+		return nil, nil, val, err
+	}
+	return unlock, update, val, nil
 }
 
-func updateLocked(ctx context.Context, table, id, uid string, data DynamoMap) error {
+func updateLocked[T any](ctx context.Context, table, id, uid string, data T) error {
 	expr, err := expression.NewBuilder().
 		WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
 		Build()
@@ -145,10 +153,13 @@ func updateLocked(ctx context.Context, table, id, uid string, data DynamoMap) er
 	}
 	item, err := dynamodbattribute.MarshalMap(lock)
 	if err != nil {
-		lib.Logger.Printf("failed to update locked: %s %s %s\n", id, uid, err)
 		return err
 	}
-	for k, v := range data {
+	dataMap, err := dynamodbattribute.MarshalMap(data)
+	if err != nil {
+		return err
+	}
+	for k, v := range dataMap {
 		_, ok := item[k]
 		if ok {
 			lib.Logger.Println("you cannot use lock internal dynamodb keys in your data, skipping: " + k)
@@ -170,7 +181,7 @@ func updateLocked(ctx context.Context, table, id, uid string, data DynamoMap) er
 	return nil
 }
 
-func releaseLock(ctx context.Context, table, id, uid string, data DynamoMap, cancelHeartbeat func()) error {
+func releaseLock[T any](ctx context.Context, table, id, uid string, data T, cancelHeartbeat func()) error {
 	cancelHeartbeat()
 	expr, err := expression.NewBuilder().
 		WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
@@ -189,10 +200,13 @@ func releaseLock(ctx context.Context, table, id, uid string, data DynamoMap, can
 	}
 	item, err := dynamodbattribute.MarshalMap(lock)
 	if err != nil {
-		lib.Logger.Printf("failed to release the lock: %s %s %s\n", id, uid, err)
 		return err
 	}
-	for k, v := range data {
+	dataMap, err := dynamodbattribute.MarshalMap(data)
+	if err != nil {
+	    return err
+	}
+	for k, v := range dataMap {
 		_, ok := item[k]
 		if ok {
 			return fmt.Errorf("you cannot use lock internal dynamodb keys in your data: " + k)
@@ -210,7 +224,6 @@ func releaseLock(ctx context.Context, table, id, uid string, data DynamoMap, can
 		lib.Logger.Printf("failed to release the lock: %s %s %s\n", id, uid, err)
 		return err
 	}
-	// lib.Logger.Printf("released the lock: %s %s\n", id, uid)
 	return nil
 }
 
@@ -260,6 +273,5 @@ func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval
 				panic("failed to heartbeat the lock: " + err.Error())
 			}
 		}
-		// lib.Logger.Printf("heartbeat: %s %s\n", id, uid)
 	}
 }
