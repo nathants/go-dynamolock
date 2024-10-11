@@ -33,7 +33,6 @@ type UnlockFn[T any] func(T) error
 type UpdateFn[T any] func(T) error
 
 func clearInternalKeys(data map[string]*dynamodb.AttributeValue) {
-	delete(data, "id")
 	delete(data, "uid")
 	delete(data, "unix")
 }
@@ -164,9 +163,7 @@ func updateLocked[T any](ctx context.Context, table, id, uid string, data T) err
 	}
 	for k, v := range dataMap {
 		_, ok := item[k]
-		if ok {
-			lib.Logger.Println("you cannot use lock internal dynamodb keys in your data, skipping: " + k)
-		} else {
+		if !ok {
 			item[k] = v
 		}
 	}
@@ -211,10 +208,9 @@ func releaseLock[T any](ctx context.Context, table, id, uid string, data T, canc
 	}
 	for k, v := range dataMap {
 		_, ok := item[k]
-		if ok {
-			return fmt.Errorf("you cannot use lock internal dynamodb keys in your data: " + k)
+		if !ok {
+			item[k] = v
 		}
-		item[k] = v
 	}
 	_, err = lib.DynamoDBClient().PutItemWithContext(ctx, &dynamodb.PutItemInput{
 		Item:                      item,
