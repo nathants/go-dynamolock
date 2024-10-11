@@ -38,11 +38,11 @@ func clearInternalKeys(data map[string]*dynamodb.AttributeValue) {
 	delete(data, "unix")
 }
 
-func Read[T any](ctx context.Context, table, id string) (T, error) {
+func Read[T any](ctx context.Context, table, id string) (*T, error) {
 	var val T
 	key, err := dynamodbattribute.MarshalMap(LockKey{ID: id})
 	if err != nil {
-		return val, err
+		return nil, err
 	}
 	out, err := lib.DynamoDBClient().GetItemWithContext(ctx, &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(true),
@@ -50,14 +50,17 @@ func Read[T any](ctx context.Context, table, id string) (T, error) {
 		Key:            key,
 	})
 	if err != nil {
-		return val, err
+		return nil, err
+	}
+	if out.Item == nil {
+		return nil, nil
 	}
 	clearInternalKeys(out.Item)
 	err = dynamodbattribute.UnmarshalMap(out.Item, &val)
 	if err != nil {
-	    return val, err
+	    return nil, err
 	}
-	return val, nil
+	return &val, nil
 }
 
 func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterval time.Duration) (UnlockFn[T], UpdateFn[T], T, error) {

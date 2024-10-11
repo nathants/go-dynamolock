@@ -181,11 +181,11 @@ func TestData(t *testing.T) {
 		t.Fatal("die2")
 	}
 	// read data without locking
-	data, err = Read[testData](ctx, table, id)
+	read, err := Read[testData](ctx, table, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data.Value != "asdf" {
+	if read.Value != "asdf" {
 		t.Fatal("die2")
 	}
 	// unlock, wiping data
@@ -283,11 +283,11 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 			panic(err)
 		}
 	}
-	data, err = Read[Data](ctx, table, id)
+	read, err := Read[Data](ctx, table, id)
 	if err != nil {
 		panic(err)
 	}
-	if data.Value != "asdf" {
+	if read.Value != "asdf" {
 		t.Fatal(lib.PformatAlways(data))
 	}
 	{
@@ -298,11 +298,11 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 			panic(err)
 		}
 	}
-	data, err = Read[Data](ctx, table, id)
+	read, err = Read[Data](ctx, table, id)
 	if err != nil {
 		panic(err)
 	}
-	if data.Value != "foo" {
+	if read.Value != "foo" {
 		t.Fatal(lib.PformatAlways(data))
 	}
 	{
@@ -317,11 +317,18 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err = Read[Data](ctx, table, id)
+	read, err = Read[Data](ctx, table, id)
 	if err != nil {
 		panic(err)
 	}
-	if data.Value != "bar" {
+	if read.Value != "bar" {
 		t.Fatal(lib.PformatAlways(data))
+	}
+	read, err = Read[Data](ctx, table, "404")
+	if err != nil {
+		panic(err)
+	}
+	if read != nil {
+		t.Fatal("shouldnt exist")
 	}
 }
