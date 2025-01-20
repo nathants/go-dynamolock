@@ -3,9 +3,9 @@ module github.com/nathants/go-dynamolock
 go 1.22
 
 require (
-	github.com/aws/aws-sdk-go v1.55.5
+	github.com/aws/aws-sdk-go v1.55.6
 	github.com/gofrs/uuid v4.4.0+incompatible
-	github.com/nathants/libaws v0.0.0-20241022011155-5dff25e02082
+	github.com/nathants/libaws v0.0.0-20250120131555-24a8303ae458
 )
 
 require (
