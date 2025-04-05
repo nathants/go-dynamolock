@@ -1,11 +1,11 @@
 module github.com/nathants/go-dynamolock
 
-go 1.22
+go 1.24
 
 require (
 	github.com/aws/aws-sdk-go v1.55.6
 	github.com/gofrs/uuid v4.4.0+incompatible
-	github.com/nathants/libaws v0.0.0-20250221023718-c02689fe21d5
+	github.com/nathants/libaws v0.0.0-20250403044500-6a01a31e6116
 )
 
 require (
@@ -18,9 +18,9 @@ require (
 	github.com/r3labs/diff/v2 v2.15.1 // indirect
 	github.com/stretchr/testify v1.7.0 // indirect
 	github.com/vmihailenco/msgpack v4.0.4+incompatible // indirect
-	golang.org/x/crypto v0.33.0 // indirect
-	golang.org/x/sync v0.11.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/crypto v0.36.0 // indirect
+	golang.org/x/sync v0.12.0 // indirect
+	golang.org/x/sys v0.31.0 // indirect
 	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
