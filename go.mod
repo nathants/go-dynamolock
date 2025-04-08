@@ -3,7 +3,6 @@ module github.com/nathants/go-dynamolock
 go 1.24
 
 require (
-	github.com/aws/aws-sdk-go v1.55.6
 	github.com/aws/aws-sdk-go-v2 v1.36.3
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue v1.18.9
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression v1.7.76
@@ -53,7 +52,6 @@ require (
 	github.com/aws/smithy-go v1.22.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
-	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mikesmitty/edkey v0.0.0-20170222072505-3356ea4e686a // indirect
 	github.com/r3labs/diff/v2 v2.15.1 // indirect

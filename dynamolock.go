@@ -6,21 +6,22 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
-	"github.com/aws/aws-sdk-go/service/dynamodb/expression"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/gofrs/uuid"
 	"github.com/nathants/libaws/lib"
 )
 
 type LockKey struct {
-	ID string `json:"id"` // unique id per lock
+	ID string `json:"id" dynamodbav:"id"` // unique id per lock
 }
 
 type LockData struct {
-	Unix int64  `json:"unix"` // timestamp of lock holder
-	Uid  string `json:"uid"`  // uuid of lock holder
+	Unix int64  `json:"unix" dynamodbav:"unix"` // timestamp of lock holder
+	Uid  string `json:"uid" dynamodbav:"uid"`   // uuid of lock holder
 }
 
 type LockRecord struct {
@@ -32,18 +33,18 @@ type UnlockFn[T any] func(T) error
 
 type UpdateFn[T any] func(T) error
 
-func clearInternalKeys(data map[string]*dynamodb.AttributeValue) {
+func clearInternalKeys(data map[string]ddbtypes.AttributeValue) {
 	delete(data, "uid")
 	delete(data, "unix")
 }
 
 func Read[T any](ctx context.Context, table, id string) (*T, error) {
 	var val T
-	key, err := dynamodbattribute.MarshalMap(LockKey{ID: id})
+	key, err := attributevalue.MarshalMap(LockKey{ID: id})
 	if err != nil {
 		return nil, err
 	}
-	out, err := lib.DynamoDBClient().GetItemWithContext(ctx, &dynamodb.GetItemInput{
+	out, err := lib.DynamoDBClient().GetItem(ctx, &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(true),
 		TableName:      aws.String(table),
 		Key:            key,
@@ -55,9 +56,9 @@ func Read[T any](ctx context.Context, table, id string) (*T, error) {
 		return nil, nil
 	}
 	clearInternalKeys(out.Item)
-	err = dynamodbattribute.UnmarshalMap(out.Item, &val)
+	err = attributevalue.UnmarshalMap(out.Item, &val)
 	if err != nil {
-	    return nil, err
+		return nil, err
 	}
 	return &val, nil
 }
@@ -66,11 +67,11 @@ func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterva
 	var val T
 	uid := uuid.Must(uuid.NewV4()).String()
 	lockKey := LockKey{ID: id}
-	key, err := dynamodbattribute.MarshalMap(lockKey)
+	key, err := attributevalue.MarshalMap(lockKey)
 	if err != nil {
 		return nil, nil, val, err
 	}
-	out, err := lib.DynamoDBClient().GetItemWithContext(ctx, &dynamodb.GetItemInput{
+	out, err := lib.DynamoDBClient().GetItem(ctx, &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(true),
 		TableName:      aws.String(table),
 		Key:            key,
@@ -80,7 +81,7 @@ func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterva
 	}
 	lock := &LockData{}
 	if len(out.Item) != 0 {
-		err = dynamodbattribute.UnmarshalMap(out.Item, &lock)
+		err = attributevalue.UnmarshalMap(out.Item, &lock)
 		if err != nil {
 			return nil, nil, val, err
 		}
@@ -110,7 +111,7 @@ func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterva
 	if err != nil {
 		return nil, nil, val, err
 	}
-	_, err = lib.DynamoDBClient().UpdateItemWithContext(ctx, &dynamodb.UpdateItemInput{
+	_, err = lib.DynamoDBClient().UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(table),
 		Key:                       key,
 		ConditionExpression:       expr.Condition(),
@@ -130,7 +131,7 @@ func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterva
 		return updateLocked(ctx, table, id, uid, data)
 	}
 	clearInternalKeys(out.Item)
-	err = dynamodbattribute.UnmarshalMap(out.Item, &val)
+	err = attributevalue.UnmarshalMap(out.Item, &val)
 	if err != nil {
 		return nil, nil, val, err
 	}
@@ -153,11 +154,11 @@ func updateLocked[T any](ctx context.Context, table, id, uid string, data T) err
 			Uid:  uid,
 		},
 	}
-	item, err := dynamodbattribute.MarshalMap(lock)
+	item, err := attributevalue.MarshalMap(lock)
 	if err != nil {
 		return err
 	}
-	dataMap, err := dynamodbattribute.MarshalMap(data)
+	dataMap, err := attributevalue.MarshalMap(data)
 	if err != nil {
 		return err
 	}
@@ -167,7 +168,7 @@ func updateLocked[T any](ctx context.Context, table, id, uid string, data T) err
 			item[k] = v
 		}
 	}
-	_, err = lib.DynamoDBClient().PutItemWithContext(ctx, &dynamodb.PutItemInput{
+	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
 		Item:                      item,
 		TableName:                 aws.String(table),
 		ConditionExpression:       expr.Condition(),
@@ -198,13 +199,13 @@ func releaseLock[T any](ctx context.Context, table, id, uid string, data T, canc
 			Uid:  "",
 		},
 	}
-	item, err := dynamodbattribute.MarshalMap(lock)
+	item, err := attributevalue.MarshalMap(lock)
 	if err != nil {
 		return err
 	}
-	dataMap, err := dynamodbattribute.MarshalMap(data)
+	dataMap, err := attributevalue.MarshalMap(data)
 	if err != nil {
-	    return err
+		return err
 	}
 	for k, v := range dataMap {
 		_, ok := item[k]
@@ -212,7 +213,7 @@ func releaseLock[T any](ctx context.Context, table, id, uid string, data T, canc
 			item[k] = v
 		}
 	}
-	_, err = lib.DynamoDBClient().PutItemWithContext(ctx, &dynamodb.PutItemInput{
+	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
 		Item:                      item,
 		TableName:                 aws.String(table),
 		ConditionExpression:       expr.Condition(),
@@ -236,7 +237,7 @@ func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval
 			panic(r)
 		}
 	}()
-	key, err := dynamodbattribute.MarshalMap(LockKey{ID: id})
+	key, err := attributevalue.MarshalMap(LockKey{ID: id})
 	if err != nil {
 		panic(err)
 	}
@@ -256,7 +257,7 @@ func heartbeatLock(ctx context.Context, table, id, uid string, heartbeatInterval
 		if err != nil {
 			panic(err)
 		}
-		_, err = lib.DynamoDBClient().UpdateItemWithContext(ctx, &dynamodb.UpdateItemInput{
+		_, err = lib.DynamoDBClient().UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(table),
 			Key:                       key,
 			ConditionExpression:       expr.Condition(),

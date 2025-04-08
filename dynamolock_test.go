@@ -2,19 +2,32 @@ package dynamolock
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/gofrs/uuid"
 	"github.com/nathants/libaws/lib"
 )
 
+func checkAccount() {
+	account, err := lib.StsAccount(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	if os.Getenv("DYNAMOLOCK_TEST_ACCOUNT") != account {
+		panic(fmt.Sprintf("%s != %s", os.Getenv("DYNAMOLOCK_TEST_ACCOUNT"), account))
+	}
+}
+
 type Data struct {
-	Value string `json:"value"`
+	Value string `json:"value" dynamodbav:"value"`
 	// note you cannot use "uid" or "unix", since those are part of LockData{}
 }
 
@@ -23,23 +36,27 @@ func Uid() string {
 }
 
 func EnsureTable(table string) error {
-	return lib.DynamoDBEnsure(
-		context.Background(),
-		&dynamodb.CreateTableInput{
-			TableName:           aws.String(table),
-			BillingMode:         aws.String("PAY_PER_REQUEST"),
-			StreamSpecification: &dynamodb.StreamSpecification{StreamEnabled: aws.Bool(false)},
-			AttributeDefinitions: []*dynamodb.AttributeDefinition{{
-				AttributeName: aws.String("id"),
-				AttributeType: aws.String("S"),
-			}},
-			KeySchema: []*dynamodb.KeySchemaElement{{
-				AttributeName: aws.String("id"),
-				KeyType:       aws.String("HASH"),
-			}},
+	checkAccount()
+	input := &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: types.BillingModePayPerRequest,
+		StreamSpecification: &types.StreamSpecification{
+			StreamEnabled: aws.Bool(false),
 		},
-		false,
-	)
+		AttributeDefinitions: []types.AttributeDefinition{
+			{
+				AttributeName: aws.String("id"),
+				AttributeType: types.ScalarAttributeTypeS,
+			},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{
+				AttributeName: aws.String("id"),
+				KeyType:       types.KeyTypeHash,
+			},
+		},
+	}
+	return lib.DynamoDBEnsure(context.Background(), input, nil, false)
 }
 
 func TestLockExpiration(t *testing.T) {
@@ -114,7 +131,7 @@ func TestReadModifyWrite(t *testing.T) {
 	sum := map[string]int{"sum": 0}
 	max := 25
 	done := make(chan error, max)
-	for i := 0; i < max; i++ {
+	for range max {
 		go func() {
 			// defer func() {}()
 			for {
@@ -209,8 +226,8 @@ func TestData(t *testing.T) {
 }
 
 type preExistingData struct {
-	ID    string `json:"id"`
-	Value string `json:"value"`
+	ID    string `json:"id" dynamodbav:"id"`
+	Value string `json:"value" dynamodbav:"value"`
 	// note you cannot use "uid" or "unix", since those are part of LockData{}
 }
 
@@ -226,14 +243,14 @@ func TestPreExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := dynamodbattribute.MarshalMap(preExistingData{
+	item, err := attributevalue.MarshalMap(preExistingData{
 		ID:    "test-id",
 		Value: "test-value",
 	})
 	if err != nil {
 		panic(err)
 	}
-	_, err = lib.DynamoDBClient().PutItemWithContext(ctx, &dynamodb.PutItemInput{
+	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(table),
 		Item:      item,
 	})
