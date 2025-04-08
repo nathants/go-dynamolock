@@ -1,5 +1,3 @@
-[![Go Reference](https://pkg.go.dev/badge/github.com/nathants/go-dynamolock.svg)](https://pkg.go.dev/github.com/nathants/go-dynamolock)
-
 # go-dynamolock
 
 ## why
