@@ -97,11 +97,22 @@ func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterva
 			return nil, nil, val, err
 		}
 	}
-	condition := expression.Name("uid").AttributeNotExists() // first put to a key uses this condition
-	_, hasUid := out.Item["uid"]
-	if hasUid {
-		condition = expression.Name("uid").Equal(expression.Value(lock.Uid)) // all other puts to a key use this condition
+
+	uidVal, hasUid := out.Item["uid"]
+	var condition expression.ConditionBuilder
+	if !hasUid {
+		condition = expression.Name("uid").AttributeNotExists() // first put asserts no such key
+	} else {
+		switch v := uidVal.(type) {
+		case *ddbtypes.AttributeValueMemberNULL:
+			if v.Value {
+				condition = expression.AttributeType(expression.Name("uid"), "NULL") // otherwise value might be null
+			}
+		default:
+			condition = expression.Name("uid").Equal(expression.Value(lock.Uid)) // or a string
+		}
 	}
+
 	expr, err := expression.NewBuilder().
 		WithCondition(condition).
 		WithUpdate(expression.
@@ -122,6 +133,7 @@ func Lock[T any](ctx context.Context, table, id string, maxAge, heartbeatInterva
 	if err != nil {
 		return nil, nil, val, fmt.Errorf("failed to acquire the lock: %w", err)
 	}
+
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	go heartbeatLock(heartbeatCtx, table, id, uid, heartbeatInterval)
 	unlock := func(data T) error {

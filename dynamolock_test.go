@@ -349,3 +349,39 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 		t.Fatal("shouldnt exist")
 	}
 }
+
+func TestNullValueDoesNotBreakLocking(t *testing.T) {
+	ctx := context.Background()
+	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
+	err := EnsureTable(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lib.DynamoDBDeleteTable(ctx, table, false) }()
+	err = lib.DynamoDBWaitForReady(ctx, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	item := map[string]types.AttributeValue{
+		"id": &types.AttributeValueMemberS{Value: "test-uid-null"},
+		"uid": &types.AttributeValueMemberNULL{Value: true},
+	}
+	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(table),
+		Item:      item,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unlock, _, data, err := Lock[Data](ctx, table, "test-uid-null", time.Second*30, time.Second*1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = unlock(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
