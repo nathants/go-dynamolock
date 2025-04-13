@@ -364,7 +364,7 @@ func TestNullValueDoesNotBreakLocking(t *testing.T) {
 	}
 
 	item := map[string]types.AttributeValue{
-		"id": &types.AttributeValueMemberS{Value: "test-uid-null"},
+		"id":  &types.AttributeValueMemberS{Value: "test-uid-null"},
 		"uid": &types.AttributeValueMemberNULL{Value: true},
 	}
 	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
