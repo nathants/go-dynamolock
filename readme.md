@@ -12,7 +12,7 @@ compared [to](https://github.com/cirello-io/dynamolock) [alternatives](https://g
 
 ## how
 
-a record in dynamodb uses a uuid and a timetamp to coordinate callers.
+a record in dynamodb uses a uuid and a timestamp to coordinate callers.
 
 to lock, a caller finds the uuid missing and adds it.
 
@@ -22,11 +22,15 @@ to unlock, the caller removes the uuid.
 
 arbitrary data can be stored atomically in the lock record. it is read via lock, written via unlock, and can be written without unlocking via update.
 
-manipulation of external state while the lock is held is subject to concurrent updates depending on maxAge, heartbeatInterval, and caller clock drift.
+that data is returned as a struct pointer. if there was no existing data for that key, nil is returned.
 
-in practice, a small heartbeatInterval, a large maxAge, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
+manipulation of external state while the lock is held is subject to concurrent updates depending on `HeartbeatMaxAge`, `HeartbeatInterval`, and caller clock drift.
 
-prefer to store data within the lock when possible, since those updates compare and swap with the uuid.
+in practice, a small `HeartbeatInterval`, a large `HeartbeatMaxAge`, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
+
+prefer to store data within the lock when possible, since those updates use compare and swap.
+
+you cannot use `"id"`, `"uid"`, or `"unix"` as `dynamodbav` values, since they are used internally by `LockRecord{}`.
 
 ## install
 
@@ -58,14 +62,19 @@ func main() {
 	// dynamodb key
 	id := "lock1"
 
-	// after a failure to unlock/heartbeat, this much time must pass before lock is available
-	maxAge := time.Second * 30
+	// after a failure to unlock/heartbeat, this much time must pass since the last heartbeat before the lock is available
+	HeartbeatMaxAge := time.Second * 30
 
-	// how often to heartbeat lock timestamp
-	heartbeat := time.Second * 1
+	// how often to heartbeat the lock
+	heartbeatInterval := time.Second * 1
 
 	// lock and read data
-	unlock, _, data, err := dynamolock.Lock[Data](ctx, table, id, maxAge, heartbeat)
+	unlock, _, data, err := dynamolock.Lock[Data](ctx, &dynamolock.LockInput{
+		Table:             table,
+		ID:                id,
+		HeartbeatMaxAge:   HeartbeatMaxAge,
+		HeartbeatInterval: HeartbeatInterval,
+	})
 	if err != nil {
 		// TODO handle lock contention
 		panic(err)

@@ -100,8 +100,8 @@ github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWE
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/mikesmitty/edkey v0.0.0-20170222072505-3356ea4e686a h1:eU8j/ClY2Ty3qdHnn0TyW3ivFoPC/0F1gQZz8yTxbbE=
 github.com/mikesmitty/edkey v0.0.0-20170222072505-3356ea4e686a/go.mod h1:v8eSC2SMp9/7FTKUncp7fH9IwPfw+ysMObcEz5FWheQ=
-github.com/nathants/libaws v0.0.0-20250412062845-cfd1a2575af2 h1:Hq+LR8SjBqCfXmbbm4gTDNCpRvSWYhtINbxngNvXL3E=
-github.com/nathants/libaws v0.0.0-20250412062845-cfd1a2575af2/go.mod h1:bMPZ5l7iSQ88sohzOrPc8/KV1y2Yu6t/h1RSdQoIdsM=
+github.com/nathants/libaws v0.0.0-20250414070355-11e74d88ea51 h1:e50WhEEyP5VP0t4gvk76Mrx72S8psbv63HJJTK+r4EY=
+github.com/nathants/libaws v0.0.0-20250414070355-11e74d88ea51/go.mod h1:fGxCji6YTdaVcfnZloCbYVl14JxgmWuphUgMvZol/Qk=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/r3labs/diff/v2 v2.15.1 h1:EOrVqPUzi+njlumoqJwiS/TgGgmZo83619FNDB9xQUg=

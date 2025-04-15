@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression v1.7.79
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.42.4
 	github.com/gofrs/uuid v4.4.0+incompatible
-	github.com/nathants/libaws v0.0.0-20250412062845-cfd1a2575af2
+	github.com/nathants/libaws v0.0.0-20250414070355-11e74d88ea51
 )
 
 require (
