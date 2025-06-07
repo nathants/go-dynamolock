@@ -1,42 +1,42 @@
-# go-dynamolock
+# Go-Dynamolock
 
-## why
+## Why
 
-locking around dynamodb should be simple and easy.
+Locking around DynamoDB should be simple and easy.
 
-## what
+## What
 
-a minimal go library for locking around dynamodb.
+A minimal Go library for locking around DynamoDB.
 
-compared [to](https://github.com/cirello-io/dynamolock) [alternatives](https://github.com/Clever/dynamodb-lock-go) it has less code and fewer features.
+Compared [to](https://github.com/cirello-io/dynamolock) [alternatives](https://github.com/Clever/dynamodb-lock-go) it has less code and fewer features.
 
-## how
+## How
 
-a record in dynamodb uses a uuid and a timestamp to coordinate callers.
+A record in DynamoDB uses a UUID and a timestamp to coordinate callers.
 
-to lock, a caller finds the uuid missing and adds it.
+To lock, a caller finds the UUID missing and adds it.
 
-while locked, the caller heartbeats the timestamp.
+While locked, the caller heartbeats the timestamp.
 
-to unlock, the caller removes the uuid.
+To unlock, the caller removes the UUID.
 
-arbitrary data can be stored atomically in the lock record. it is read via lock, written via unlock, and can be written without unlocking via update.
+Arbitrary data can be stored atomically in the lock record. It is read via lock, written via unlock, and can be written without unlocking via update.
 
-that data is returned as a struct pointer. if there was no existing data for that key, nil is returned.
+That data is returned as a struct pointer. If there was no existing data for that key, nil is returned.
 
-manipulation of external state while the lock is held is subject to concurrent updates depending on `HeartbeatMaxAge`, `HeartbeatInterval`, and caller clock drift.
+Manipulation of external state while the lock is held is subject to concurrent updates depending on `HeartbeatMaxAge`, `HeartbeatInterval`, and caller clock drift.
 
-in practice, a small `HeartbeatInterval`, a large `HeartbeatMaxAge`, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
+In practice, a small `HeartbeatInterval`, a large `HeartbeatMaxAge`, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
 
-prefer to store data within the lock when possible, since those updates use compare and swap.
+Prefer to store data within the lock when possible, since those updates use compare and swap.
 
-you cannot use `"id"`, `"uid"`, or `"unix"` as `dynamodbav` values, since they are used internally by `LockRecord{}`.
+You cannot use `"id"`, `"uid"`, or `"unix"` as `dynamodbav` values, since they are used internally by `LockRecord{}`.
 
-## install
+## Install
 
 `go get github.com/nathants/go-dynamolock`
 
-## usage
+## Usage
 
 ```go
 package main
