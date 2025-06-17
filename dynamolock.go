@@ -2,6 +2,7 @@ package dynamolock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"strings"
@@ -33,10 +34,39 @@ type LockRecord struct {
 type UnlockFn[T any] func(*T) error
 
 type UpdateFn[T any] func(*T) error
-
 func clearInternalKeys(data map[string]ddbtypes.AttributeValue) {
-	delete(data, "uid")
-	delete(data, "unix")
+    delete(data, "uid")
+    delete(data, "unix")
+}
+
+func buildItem[T any](id string, uid string, unix int64, data *T) (map[string]ddbtypes.AttributeValue, error) {
+    lock := &LockRecord{
+        LockKey: LockKey{
+            ID: id,
+        },
+        LockData: LockData{
+            Unix: unix,
+            Uid:  uid,
+        },
+    }
+    item, err := attributevalue.MarshalMap(lock)
+    if err != nil {
+        return nil, err
+    }
+    if data == nil {
+        var val T
+        data = &val
+    }
+    dataMap, err := attributevalue.MarshalMap(data)
+    if err != nil {
+        return nil, err
+    }
+    for k, v := range dataMap {
+        if _, ok := item[k]; !ok {
+            item[k] = v
+        }
+    }
+    return item, nil
 }
 
 type LockInput struct {
@@ -45,6 +75,8 @@ type LockInput struct {
 	HeartbeatMaxAge   time.Duration
 	HeartbeatInterval time.Duration
 	HeartbeatErrFn    func(error)
+	Retries           int
+	RetriesSleep      time.Duration
 }
 
 func Read[T any](ctx context.Context, table, id string) (*T, error) {
@@ -80,12 +112,15 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 	if input.HeartbeatMaxAge <= 0 {
 		return nil, nil, nil, fmt.Errorf("heartbeat max age should be greater than zero")
 	}
-	if input.HeartbeatMaxAge < input.HeartbeatInterval && !strings.HasPrefix(input.Table, "test-go-dynamolock-") {
-		return nil, nil, nil, fmt.Errorf("heartbeat max age should be greater than heartbeat interval")
-	}
-	if input.ID == "" {
-		return nil, nil, nil, fmt.Errorf("id should not be empty string")
-	}
+    if input.HeartbeatMaxAge < input.HeartbeatInterval && !strings.HasPrefix(input.Table, "test-go-dynamolock-") {
+        return nil, nil, nil, fmt.Errorf("heartbeat max age should be greater than heartbeat interval")
+    }
+    if input.ID == "" {
+        return nil, nil, nil, fmt.Errorf("id should not be empty string")
+    }
+    if input.Retries < 0 {
+        return nil, nil, nil, fmt.Errorf("retries should not be negative")
+    }
 	uid := uuid.Must(uuid.NewV4()).String()
 	lockKey := LockKey{ID: input.ID}
 	key, err := attributevalue.MarshalMap(lockKey)
@@ -108,52 +143,95 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 		}
 	}
 
-	if lock.Unix == 0 {
-		// lib.Logger.Printf("lock is vacant: %s %s\n", input.ID, uid)
-	} else {
-		age := time.Since(time.Unix(int64(lock.Unix), 0))
-		if age > input.HeartbeatMaxAge {
-			// lib.Logger.Printf("lock is expired: %s %s\n", input.ID, uid)
+	acquireLock := func() error {
+		uidVal, hasUid := out.Item["uid"]
+		var condition expression.ConditionBuilder
+		if !hasUid {
+			condition = expression.Name("uid").AttributeNotExists() // first put asserts no such key
 		} else {
+			switch v := uidVal.(type) {
+			case *ddbtypes.AttributeValueMemberNULL:
+				if v.Value {
+					condition = expression.AttributeType(expression.Name("uid"), "NULL") // otherwise value might be null
+				}
+			default:
+				condition = expression.Name("uid").Equal(expression.Value(lock.Uid)) // or a string
+			}
+		}
+
+		expr, err := expression.NewBuilder().
+			WithCondition(condition).
+			WithUpdate(expression.
+				Set(expression.Name("uid"), expression.Value(uid)).
+				Set(expression.Name("unix"), expression.Value(time.Now().Unix()))).
+			Build()
+		if err != nil {
+			return err
+		}
+		_, err = lib.DynamoDBClient().UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(input.Table),
+			Key:                       key,
+			ConditionExpression:       expr.Condition(),
+			UpdateExpression:          expr.Update(),
+			ExpressionAttributeValues: expr.Values(),
+			ExpressionAttributeNames:  expr.Names(),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to acquire the lock: %w", err)
+		}
+		return nil
+	}
+
+	retryCount := 0
+	for {
+		age := time.Since(time.Unix(lock.Unix, 0))
+		if lock.Unix == 0 {
+			// lib.Logger.Printf("lock is vacant: %s %s\n", input.ID, uid)
+			err := acquireLock()
+			if err == nil {
+				break
+			} else if !isConditionalCheckFailed(err) {
+				return nil, nil, nil, err
+			}
+		} else if age > input.HeartbeatMaxAge {
+			// lib.Logger.Printf("lock is expired: %s %s\n", input.ID, uid)
+			err := acquireLock()
+			if err == nil {
+				break
+			} else if !isConditionalCheckFailed(err) {
+				return nil, nil, nil, err
+			}
+		}
+		if retryCount >= input.Retries {
 			err = fmt.Errorf("lock is held: %s %s", input.ID, uid)
 			return nil, nil, nil, err
 		}
-	}
-
-	uidVal, hasUid := out.Item["uid"]
-	var condition expression.ConditionBuilder
-	if !hasUid {
-		condition = expression.Name("uid").AttributeNotExists() // first put asserts no such key
-	} else {
-		switch v := uidVal.(type) {
-		case *ddbtypes.AttributeValueMemberNULL:
-			if v.Value {
-				condition = expression.AttributeType(expression.Name("uid"), "NULL") // otherwise value might be null
-			}
-		default:
-			condition = expression.Name("uid").Equal(expression.Value(lock.Uid)) // or a string
+		retryCount++
+		sleepDuration := 1 * time.Second
+		if input.RetriesSleep > 0 {
+			sleepDuration = input.RetriesSleep
 		}
-	}
-
-	expr, err := expression.NewBuilder().
-		WithCondition(condition).
-		WithUpdate(expression.
-			Set(expression.Name("uid"), expression.Value(uid)).
-			Set(expression.Name("unix"), expression.Value(time.Now().Unix()))).
-		Build()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	_, err = lib.DynamoDBClient().UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:                 aws.String(input.Table),
-		Key:                       key,
-		ConditionExpression:       expr.Condition(),
-		UpdateExpression:          expr.Update(),
-		ExpressionAttributeValues: expr.Values(),
-		ExpressionAttributeNames:  expr.Names(),
-	})
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to acquire the lock: %w", err)
+		// lib.Logger.Printf("retrying lock: id=%s uid=%s retry=%d/%d sleep=%s age=%.1f/%.1f\n", input.ID, uid, retryCount, input.Retries, sleepDuration, age.Seconds(), input.HeartbeatMaxAge.Seconds())
+		select {
+		case <-time.After(sleepDuration):
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		}
+		out, err = lib.DynamoDBClient().GetItem(ctx, &dynamodb.GetItemInput{
+			ConsistentRead: aws.Bool(true),
+			TableName:      aws.String(input.Table),
+			Key:            key,
+		})
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		lock = &LockData{}
+		if len(out.Item) != 0 {
+			err = attributevalue.UnmarshalMap(out.Item, &lock)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
 	}
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
@@ -178,6 +256,11 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 	return unlock, update, &val, nil
 }
 
+func isConditionalCheckFailed(err error) bool {
+	var condErr *ddbtypes.ConditionalCheckFailedException
+	return errors.As(err, &condErr)
+}
+
 func updateLocked[T any](ctx context.Context, input *LockInput, uid string, data *T) error {
 	expr, err := expression.NewBuilder().
 		WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
@@ -185,33 +268,10 @@ func updateLocked[T any](ctx context.Context, input *LockInput, uid string, data
 	if err != nil {
 		return err
 	}
-	lock := &LockRecord{
-		LockKey: LockKey{
-			ID: input.ID,
-		},
-		LockData: LockData{
-			Unix: time.Now().Unix(),
-			Uid:  uid,
-		},
-	}
-	item, err := attributevalue.MarshalMap(lock)
-	if err != nil {
-		return err
-	}
-	if data == nil {
-		var val T
-		data = &val
-	}
-	dataMap, err := attributevalue.MarshalMap(data)
-	if err != nil {
-		return err
-	}
-	for k, v := range dataMap {
-		_, ok := item[k]
-		if !ok {
-			item[k] = v
-		}
-	}
+    item, err := buildItem(input.ID, uid, time.Now().Unix(), data)
+    if err != nil {
+        return err
+    }
 	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
 		Item:                      item,
 		TableName:                 aws.String(input.Table),
@@ -227,40 +287,17 @@ func updateLocked[T any](ctx context.Context, input *LockInput, uid string, data
 }
 
 func releaseLock[T any](ctx context.Context, input *LockInput, uid string, data *T, cancelHeartbeat func()) error {
-	cancelHeartbeat()
 	expr, err := expression.NewBuilder().
 		WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
 		Build()
 	if err != nil {
 		return err
 	}
-	lock := &LockRecord{
-		LockKey: LockKey{
-			ID: input.ID,
-		},
-		LockData: LockData{
-			Unix: 0,
-			Uid:  "",
-		},
-	}
-	item, err := attributevalue.MarshalMap(lock)
-	if err != nil {
-		return err
-	}
-	if data == nil {
-		var val T
-		data = &val
-	}
-	dataMap, err := attributevalue.MarshalMap(data)
-	if err != nil {
-		return err
-	}
-	for k, v := range dataMap {
-		_, ok := item[k]
-		if !ok {
-			item[k] = v
-		}
-	}
+    cancelHeartbeat()
+    item, err := buildItem(input.ID, "", 0, data)
+    if err != nil {
+        return err
+    }
 	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
 		Item:                      item,
 		TableName:                 aws.String(input.Table),
@@ -269,7 +306,7 @@ func releaseLock[T any](ctx context.Context, input *LockInput, uid string, data 
 		ExpressionAttributeValues: expr.Values(),
 	})
 	if err != nil {
-		// lib.Logger.Printf("failed to release the lock: %s %s %s\n", input.ID, uid, err)
+		lib.Logger.Printf("failed to release the lock: %s %s %s\n", input.ID, uid, err)
 		return err
 	}
 	return nil
@@ -304,7 +341,7 @@ func heartbeatLock(ctx context.Context, input *LockInput, uid string) {
 		expr, err := expression.NewBuilder().
 			WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
 			WithUpdate(expression.
-				Set(expression.Name("unix"), expression.Value(int(time.Now().Unix())))).
+				Set(expression.Name("unix"), expression.Value(time.Now().Unix()))).
 			Build()
 		if err != nil {
 			if input.HeartbeatErrFn != nil {

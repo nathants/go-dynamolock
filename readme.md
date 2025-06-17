@@ -28,6 +28,8 @@ Manipulation of external state while the lock is held is subject to concurrent u
 
 In practice, a small `HeartbeatInterval`, a large `HeartbeatMaxAge`, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
 
+When lock contention is expected you can set `Retries` to automatically retry acquiring the lock. Use `RetriesSleep` to control how long to sleep between attempts.
+
 Prefer to store data within the lock when possible, since those updates use compare and swap.
 
 You cannot use `"id"`, `"uid"`, or `"unix"` as `dynamodbav` values, since they are used internally by `LockRecord{}`.
@@ -74,6 +76,8 @@ func main() {
 		ID:                id,
 		HeartbeatMaxAge:   HeartbeatMaxAge,
 		HeartbeatInterval: HeartbeatInterval,
+		Retries:           5,
+		RetriesSleep:      1 * time.Second,
 	})
 	if err != nil {
 		// TODO handle lock contention
