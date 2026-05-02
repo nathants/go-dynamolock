@@ -2,8 +2,12 @@ package dynamolock
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"math/rand"
@@ -47,6 +51,39 @@ func getTableName() string {
 }
 
 func ClearTable(ctx context.Context, table string) error {
+	deleteBatch := func(reqs []types.WriteRequest) error {
+		const maxUnprocessedRetries = 20
+		for attempt := 0; len(reqs) != 0; attempt++ {
+			if attempt >= maxUnprocessedRetries {
+				return fmt.Errorf("failed to delete %d unprocessed items from %s after %d retries", len(reqs), table, maxUnprocessedRetries)
+			}
+			out, err := lib.DynamoDBClient().BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+				RequestItems: map[string][]types.WriteRequest{
+					table: reqs,
+				},
+			})
+			if err != nil {
+				return err
+			}
+			reqs = out.UnprocessedItems[table]
+			if len(reqs) == 0 {
+				return nil
+			}
+			delay := time.Duration(attempt+1) * 200 * time.Millisecond
+			if delay > 2*time.Second {
+				delay = 2 * time.Second
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+
 	for {
 		out, err := lib.DynamoDBClient().Scan(ctx, &dynamodb.ScanInput{
 			TableName:            aws.String(table),
@@ -66,14 +103,17 @@ func ClearTable(ctx context.Context, table string) error {
 					Key: item,
 				},
 			})
+			if len(reqs) == 25 {
+				if err := deleteBatch(reqs); err != nil {
+					return err
+				}
+				reqs = nil
+			}
 		}
-		_, err = lib.DynamoDBClient().BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
-			RequestItems: map[string][]types.WriteRequest{
-				table: reqs,
-			},
-		})
-		if err != nil {
-			return err
+		if len(reqs) != 0 {
+			if err := deleteBatch(reqs); err != nil {
+				return err
+			}
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			return nil
@@ -86,7 +126,7 @@ func teardown(table string) {
 	if os.Getenv("REUSE") != "" {
 		_ = ClearTable(ctx, table)
 	} else {
-		_ = lib.DynamoDBDeleteTable(ctx, table, false)
+		_ = lib.DynamoDBDeleteTable(ctx, table, false, false)
 	}
 }
 
@@ -170,7 +210,8 @@ func TestBasic(t *testing.T) {
 }
 
 func TestReadModifyWrite(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 	table := getTableName()
 	err := setup(table)
 	if err != nil {
@@ -182,13 +223,19 @@ func TestReadModifyWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Uid()
-	sum := map[string]int{"sum": 0}
 	max := 50
+	var sum int32
+	var inCriticalSection int32
 	done := make(chan error, max)
 	for range max {
 		go func() {
-			// defer func() {}()
 			for {
+				select {
+				case <-ctx.Done():
+					done <- ctx.Err()
+					return
+				default:
+				}
 				unlock, _, data, err := Lock[Data](ctx, &LockInput{
 					Table:             table,
 					ID:                id,
@@ -197,31 +244,242 @@ func TestReadModifyWrite(t *testing.T) {
 					Retries:           5,
 					RetriesSleep:      1 * time.Second,
 				})
-				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
 				if err != nil {
 					continue
 				}
-				sum["sum"]++
-				done <- nil
-				lib.Logger.Println("releasing lock, sum:", sum)
+				if !atomic.CompareAndSwapInt32(&inCriticalSection, 0, 1) {
+					_ = unlock(data)
+					done <- fmt.Errorf("lock allowed concurrent critical sections")
+					return
+				}
+				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
+				newSum := atomic.AddInt32(&sum, 1)
+				lib.Logger.Println("releasing lock, sum:", newSum)
+				atomic.StoreInt32(&inCriticalSection, 0)
 				err = unlock(data)
 				if err != nil {
-					panic(err)
+					done <- err
+					return
 				}
-				break
+				done <- nil
+				return
 			}
 		}()
 	}
 	for range max {
-		<-done
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
-	if sum["sum"] != max {
-		t.Errorf("expected %d, got %d", max, sum["sum"])
+	if got := atomic.LoadInt32(&sum); got != int32(max) {
+		t.Errorf("expected %d, got %d", max, got)
 	}
 }
 
 type testData struct {
 	Value string
+}
+
+func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	table := getTableName()
+	err := setup(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer teardown(table)
+	err = lib.DynamoDBWaitForReady(ctx, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := Uid()
+	unlock, _, _, err := Lock[Data](ctx, &LockInput{
+		Table:             table,
+		ID:                id,
+		HeartbeatMaxAge:   2 * time.Minute,
+		HeartbeatInterval: 2 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = unlock(&Data{Value: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalClient := dynamoDBClient
+	defer func() { dynamoDBClient = originalClient }()
+
+	seenAcquireAttempt := make(chan struct{}, 1)
+	releaseAcquire := make(chan struct{})
+	releaseDelayedAcquire := sync.OnceFunc(func() { close(releaseAcquire) })
+	t.Cleanup(releaseDelayedAcquire)
+	dynamoDBClient = func() *dynamodb.Client {
+		client := originalClient()
+		return dynamodb.New(client.Options(), func(options *dynamodb.Options) {
+			options.HTTPClient = lockAcquireDelayClient{
+				base:               options.HTTPClient,
+				seenAcquireAttempt: seenAcquireAttempt,
+				releaseAcquire:     releaseAcquire,
+			}
+		})
+	}
+
+	contenderCtx, cancelContender := context.WithCancel(ctx)
+	t.Cleanup(cancelContender)
+	lockResult := make(chan struct {
+		unlock UnlockFn[Data]
+		data   *Data
+		err    error
+	}, 1)
+	go func() {
+		delayedCtx := context.WithValue(contenderCtx, delayAcquireContextKey{}, true)
+		unlock, _, data, err := Lock[Data](delayedCtx, &LockInput{
+			Table:             table,
+			ID:                id,
+			HeartbeatMaxAge:   30 * time.Second,
+			HeartbeatInterval: 30 * time.Second,
+		})
+		lockResult <- struct {
+			unlock UnlockFn[Data]
+			data   *Data
+			err    error
+		}{unlock: unlock, data: data, err: err}
+	}()
+
+	select {
+	case <-seenAcquireAttempt:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for contender's acquire attempt")
+	}
+
+	otherUnlock, _, data, err := Lock[Data](ctx, &LockInput{
+		Table:             table,
+		ID:                id,
+		HeartbeatMaxAge:   2 * time.Minute,
+		HeartbeatInterval: 2 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data == nil || data.Value != "old" {
+		t.Fatalf("expected other holder to read old data, got %#v", data)
+	}
+	err = otherUnlock(&Data{Value: "fresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseDelayedAcquire()
+
+	select {
+	case result := <-lockResult:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.data == nil {
+			t.Fatal("data is nil")
+		}
+		if result.data.Value != "fresh" {
+			t.Fatalf("expected fresh data from successful acquisition, got %q", result.data.Value)
+		}
+		err = result.unlock(result.data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for contender lock result")
+	}
+}
+
+type retryCheckClient struct {
+	attempts int32
+}
+
+func newRetryCheckDynamoDBClient(c *retryCheckClient) func() *dynamodb.Client {
+	return func() *dynamodb.Client {
+		return dynamodb.New(dynamodb.Options{
+			Region: "us-east-1",
+			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
+			}),
+			HTTPClient: c,
+		})
+	}
+}
+
+func (c *retryCheckClient) Do(req *http.Request) (*http.Response, error) {
+	atomic.AddInt32(&c.attempts, 1)
+	body := `{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"conditional failed"}`
+	return &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Status:     "400 Bad Request",
+		Header: http.Header{
+			"Content-Type":     []string{"application/x-amz-json-1.0"},
+			"X-Amzn-Requestid": []string{"test-request-id"},
+		},
+		Body:    io.NopCloser(strings.NewReader(body)),
+		Request: req,
+	}, nil
+}
+
+func assertRetryAttempts(t *testing.T, retries int, retriesSleep time.Duration) time.Duration {
+	t.Helper()
+	originalClient := dynamoDBClient
+	t.Cleanup(func() { dynamoDBClient = originalClient })
+	checkClient := &retryCheckClient{}
+	dynamoDBClient = newRetryCheckDynamoDBClient(checkClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, _, err := Lock[Data](ctx, &LockInput{
+		Table:             "retry-check",
+		ID:                "retry-check",
+		HeartbeatMaxAge:   30 * time.Second,
+		HeartbeatInterval: 1 * time.Second,
+		Retries:           retries,
+		RetriesSleep:      retriesSleep,
+	})
+	duration := time.Since(start)
+	if err == nil {
+		t.Fatal("expected lock acquisition to fail")
+	}
+	if !strings.Contains(err.Error(), "lock is held") {
+		t.Fatalf("expected 'lock is held' error, got: %v", err)
+	}
+	want := int32(retries + 1)
+	if got := atomic.LoadInt32(&checkClient.attempts); got != want {
+		t.Fatalf("expected %d acquire attempts, got %d", want, got)
+	}
+	return duration
+}
+
+type delayAcquireContextKey struct{}
+
+type lockAcquireDelayClient struct {
+	base               dynamodb.HTTPClient
+	seenAcquireAttempt chan<- struct{}
+	releaseAcquire     <-chan struct{}
+}
+
+func (c lockAcquireDelayClient) Do(req *http.Request) (*http.Response, error) {
+	if req.Context().Value(delayAcquireContextKey{}) != true {
+		return c.base.Do(req)
+	}
+	if req.Header.Get("X-Amz-Target") == "DynamoDB_20120810.UpdateItem" {
+		select {
+		case c.seenAcquireAttempt <- struct{}{}:
+		default:
+		}
+		select {
+		case <-c.releaseAcquire:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+	}
+	return c.base.Do(req)
 }
 
 func TestData(t *testing.T) {
@@ -500,8 +758,18 @@ func TestHeartbeatErrorHandling(t *testing.T) {
 	}
 	id := Uid()
 	var heartbeatErrors int32
+	sabotageCtx, cancelSabotage := context.WithCancel(ctx)
+	defer cancelSabotage()
 	go func() {
-		time.Sleep(2 * time.Second)
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-sabotageCtx.Done():
+			return
+		}
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			val := LockRecord{
 				LockKey: LockKey{
@@ -516,19 +784,21 @@ func TestHeartbeatErrorHandling(t *testing.T) {
 			if err != nil {
 				panic(err)
 			}
-			go func() {
-				_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
-					TableName: aws.String(table),
-					Item:      item,
-				})
-				if err != nil {
-					if strings.Contains(err.Error(), "ResourceNotFoundException") {
-						return // table deleted
-					}
-					panic(err)
+			_, err = lib.DynamoDBClient().PutItem(sabotageCtx, &dynamodb.PutItemInput{
+				TableName: aws.String(table),
+				Item:      item,
+			})
+			if err != nil {
+				if sabotageCtx.Err() != nil || strings.Contains(err.Error(), "ResourceNotFoundException") {
+					return
 				}
-			}()
-			time.Sleep(500 * time.Millisecond)
+				panic(err)
+			}
+			select {
+			case <-ticker.C:
+			case <-sabotageCtx.Done():
+				return
+			}
 		}
 	}()
 	unlock, _, _, err := Lock[Data](ctx, &LockInput{
@@ -770,53 +1040,7 @@ func TestUpdateWithNil(t *testing.T) {
 }
 
 func TestLockRetriesWhenHeldNotExpired(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-
-	// First acquire lock
-	unlock1, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = unlock1(nil) }()
-
-	// Try to acquire lock again with retries
-	start := time.Now()
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           2,
-		RetriesSleep:      500 * time.Millisecond,
-	})
-	duration := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected error, lock should remain held")
-	}
-	if !strings.Contains(err.Error(), "lock is held") {
-		t.Fatalf("expected 'lock is held' error, got: %v", err)
-	}
-	// Should have retried 2 times with 500ms sleep each
-	if duration < 1*time.Second {
-		t.Fatalf("expected at least 1 second duration for 2 retries, got: %v", duration)
-	}
+	assertRetryAttempts(t, 2, time.Nanosecond)
 }
 
 func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
@@ -862,246 +1086,43 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 }
 
 func TestLockFailsAfterExhaustingRetries(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-
-	// First acquire lock
-	unlock1, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = unlock1(nil) }()
-
-	// Try with limited retries
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           1,
-		RetriesSleep:      100 * time.Millisecond,
-	})
-	if err == nil {
-		t.Fatal("expected error after exhausting retries")
-	}
-	if !strings.Contains(err.Error(), "lock is held") {
-		t.Fatalf("expected 'lock is held' error, got: %v", err)
-	}
+	assertRetryAttempts(t, 1, time.Nanosecond)
 }
 
 func TestLockUsesCustomRetriesSleep(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-
-	// First acquire lock
-	unlock1, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = unlock1(nil) }()
-
-	// Try with custom retry sleep
-	start := time.Now()
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           3,
-		RetriesSleep:      200 * time.Millisecond,
-	})
-	duration := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected error, lock should remain held")
-	}
-	// Should have slept 3 times * 200ms = 600ms minimum
-	if duration < 600*time.Millisecond {
-		t.Fatalf("expected at least 600ms duration for custom sleep, got: %v", duration)
-	}
-	if duration > 1*time.Second {
-		t.Fatalf("expected less than 1s duration for custom sleep, got: %v", duration)
+	duration := assertRetryAttempts(t, 3, 10*time.Millisecond)
+	if duration < 30*time.Millisecond {
+		t.Fatalf("expected custom retry sleep to delay at least 30ms, got %s", duration)
 	}
 }
 
 func TestLockUsesDefaultSleepWhenNotProvided(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
+	originalClient := dynamoDBClient
+	t.Cleanup(func() { dynamoDBClient = originalClient })
+	checkClient := &retryCheckClient{}
+	dynamoDBClient = newRetryCheckDynamoDBClient(checkClient)
 
-	// First acquire lock
-	unlock1, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = unlock1(nil) }()
-
-	// Try without RetriesSleep (should use 1 second default)
-	start := time.Now()
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, _, _, err := Lock[Data](ctx, &LockInput{
+		Table:             "retry-check",
+		ID:                "retry-check",
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 		Retries:           1,
 	})
-	duration := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected error, lock should remain held")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context deadline while waiting on default retry sleep, got: %v", err)
 	}
-	// Should have used default 1 second sleep
-	if duration < 1*time.Second {
-		t.Fatalf("expected at least 1 second duration for default sleep, got: %v", duration)
-	}
-	if duration > 2*time.Second {
-		t.Fatalf("expected less than 2s duration for default sleep, got: %v", duration)
+	if got := atomic.LoadInt32(&checkClient.attempts); got != 1 {
+		t.Fatalf("expected 1 acquire attempt before default retry sleep, got %d", got)
 	}
 }
 
 func TestLockWithZeroRetriesFailsImmediately(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-
-	// First acquire lock
-	unlock1, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = unlock1(nil) }()
-
-	// Try with zero retries
-	start := time.Now()
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           0,
-	})
-	duration := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected error with zero retries")
-	}
-	if !strings.Contains(err.Error(), "lock is held") {
-		t.Fatalf("expected 'lock is held' error, got: %v", err)
-	}
-	// Should fail immediately without any sleep
-	if duration > 100*time.Millisecond {
-		t.Fatalf("expected immediate failure with zero retries, took: %v", duration)
-	}
+	assertRetryAttempts(t, 0, time.Nanosecond)
 }
 
 func TestLockRetryCounterIncrementsCorrectly(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-
-	// First acquire lock
-	unlock1, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = unlock1(nil) }()
-
-	// Try with specific number of retries and verify timing
-	retries := 3
-	start := time.Now()
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           retries,
-		RetriesSleep:      100 * time.Millisecond,
-	})
-	duration := time.Since(start)
-
-	if err == nil {
-		t.Fatal("expected error, lock should remain held")
-	}
-	// Should have done exactly 3 retries with 100ms sleep each
-	expectedMin := time.Duration(retries) * 100 * time.Millisecond
-	if duration < expectedMin {
-		t.Fatalf("expected at least %v duration for %d retries, got: %v", expectedMin, retries, duration)
-	}
-	// Allow some buffer for execution time
-	expectedMax := expectedMin + 500*time.Millisecond
-	if duration > expectedMax {
-		t.Fatalf("expected less than %v duration for %d retries, got: %v", expectedMax, retries, duration)
-	}
+	assertRetryAttempts(t, 3, time.Nanosecond)
 }
