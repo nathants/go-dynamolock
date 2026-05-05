@@ -46,13 +46,12 @@ package main
 import (
 	"context"
 	"time"
+
 	"github.com/nathants/go-dynamolock"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 )
 
-
 type Data struct {
-    Value string
+	Value string
 }
 
 func main() {
@@ -65,7 +64,7 @@ func main() {
 	id := "lock1"
 
 	// after a failure to unlock/heartbeat, this much time must pass since the last heartbeat before the lock is available
-	HeartbeatMaxAge := time.Second * 30
+	heartbeatMaxAge := time.Second * 30
 
 	// how often to heartbeat the lock
 	heartbeatInterval := time.Second * 1
@@ -74,8 +73,8 @@ func main() {
 	unlock, _, data, err := dynamolock.Lock[Data](ctx, &dynamolock.LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   HeartbeatMaxAge,
-		HeartbeatInterval: HeartbeatInterval,
+		HeartbeatMaxAge:   heartbeatMaxAge,
+		HeartbeatInterval: heartbeatInterval,
 		Retries:           5,
 		RetriesSleep:      1 * time.Second,
 	})
@@ -86,10 +85,13 @@ func main() {
 
 	// do work with the lock
 	time.Sleep(time.Second * 1)
+	if data == nil {
+		data = &Data{}
+	}
 	data.Value = "updated"
 
-	// unlock and write data
-	err = unlock(data)
+	// unlock and write data. Use a fresh context so cleanup can still run if the lock-acquisition context is canceled.
+	err = unlock(context.Background(), data)
 	if err != nil {
 		panic(err)
 	}

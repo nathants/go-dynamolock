@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,9 +31,9 @@ type LockRecord struct {
 	LockData
 }
 
-type UnlockFn[T any] func(*T) error
+type UnlockFn[T any] func(context.Context, *T) error
 
-type UpdateFn[T any] func(*T) error
+type UpdateFn[T any] func(context.Context, *T) error
 
 var dynamoDBClient = lib.DynamoDBClient
 
@@ -114,7 +115,7 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 	if input.HeartbeatMaxAge <= 0 {
 		return nil, nil, nil, fmt.Errorf("heartbeat max age should be greater than zero")
 	}
-	if input.HeartbeatMaxAge < input.HeartbeatInterval {
+	if input.HeartbeatMaxAge <= input.HeartbeatInterval {
 		return nil, nil, nil, fmt.Errorf("heartbeat max age should be greater than heartbeat interval")
 	}
 	if input.ID == "" {
@@ -200,12 +201,22 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 	}
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
-	go heartbeatLock(heartbeatCtx, input, uid)
+	var releasing atomic.Bool
+	var released atomic.Bool
+	go heartbeatLock(heartbeatCtx, input, uid, &releasing, &released)
 
-	unlock := func(data *T) error {
-		return releaseLock(ctx, input, uid, data, cancelHeartbeat)
+	unlock := func(ctx context.Context, data *T) error {
+		releasing.Store(true)
+		err := releaseLock(ctx, input, uid, data)
+		if err != nil {
+			releasing.Store(false)
+			return err
+		}
+		released.Store(true)
+		cancelHeartbeat()
+		return nil
 	}
-	update := func(data *T) error {
+	update := func(ctx context.Context, data *T) error {
 		return updateLocked(ctx, input, uid, data)
 	}
 
@@ -242,14 +253,13 @@ func updateLocked[T any](ctx context.Context, input *LockInput, uid string, data
 	return nil
 }
 
-func releaseLock[T any](ctx context.Context, input *LockInput, uid string, data *T, cancelHeartbeat func()) error {
+func releaseLock[T any](ctx context.Context, input *LockInput, uid string, data *T) error {
 	expr, err := expression.NewBuilder().
 		WithCondition(expression.Name("uid").Equal(expression.Value(uid))).
 		Build()
 	if err != nil {
 		return err
 	}
-	cancelHeartbeat()
 	item, err := buildItem(input.ID, "", 0, data)
 	if err != nil {
 		return err
@@ -268,7 +278,7 @@ func releaseLock[T any](ctx context.Context, input *LockInput, uid string, data 
 	return nil
 }
 
-func heartbeatLock(ctx context.Context, input *LockInput, uid string) {
+func heartbeatLock(ctx context.Context, input *LockInput, uid string, releasing, released *atomic.Bool) {
 	defer func() {
 		r := recover()
 		if r != nil {
@@ -308,6 +318,9 @@ func heartbeatLock(ctx context.Context, input *LockInput, uid string) {
 		}
 		attempts := 5 // ~5 seconds of retries
 		err = lib.RetryAttempts(ctx, attempts, func() error {
+			if released.Load() {
+				return nil
+			}
 			_, err := dynamoDBClient().UpdateItem(ctx, &dynamodb.UpdateItemInput{
 				TableName:                 aws.String(input.Table),
 				Key:                       key,
@@ -319,6 +332,12 @@ func heartbeatLock(ctx context.Context, input *LockInput, uid string) {
 			return err
 		})
 		if err != nil {
+			if released.Load() {
+				return
+			}
+			if releasing.Load() && isConditionalCheckFailed(err) {
+				continue
+			}
 			select {
 			case <-ctx.Done():
 				return

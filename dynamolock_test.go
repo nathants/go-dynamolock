@@ -203,7 +203,7 @@ func TestBasic(t *testing.T) {
 	if err == nil {
 		t.Fatal("acquired lock twice")
 	}
-	err = unlock(data)
+	err = unlock(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +248,7 @@ func TestReadModifyWrite(t *testing.T) {
 					continue
 				}
 				if !atomic.CompareAndSwapInt32(&inCriticalSection, 0, 1) {
-					_ = unlock(data)
+					_ = unlock(ctx, data)
 					done <- fmt.Errorf("lock allowed concurrent critical sections")
 					return
 				}
@@ -256,7 +256,7 @@ func TestReadModifyWrite(t *testing.T) {
 				newSum := atomic.AddInt32(&sum, 1)
 				lib.Logger.Println("releasing lock, sum:", newSum)
 				atomic.StoreInt32(&inCriticalSection, 0)
-				err = unlock(data)
+				err = unlock(ctx, data)
 				if err != nil {
 					done <- err
 					return
@@ -299,12 +299,12 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 		Table:             table,
 		ID:                id,
 		HeartbeatMaxAge:   2 * time.Minute,
-		HeartbeatInterval: 2 * time.Minute,
+		HeartbeatInterval: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = unlock(&Data{Value: "old"})
+	err = unlock(ctx, &Data{Value: "old"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 			Table:             table,
 			ID:                id,
 			HeartbeatMaxAge:   30 * time.Second,
-			HeartbeatInterval: 30 * time.Second,
+			HeartbeatInterval: 15 * time.Second,
 		})
 		lockResult <- struct {
 			unlock UnlockFn[Data]
@@ -359,7 +359,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 		Table:             table,
 		ID:                id,
 		HeartbeatMaxAge:   2 * time.Minute,
-		HeartbeatInterval: 2 * time.Minute,
+		HeartbeatInterval: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +367,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 	if data == nil || data.Value != "old" {
 		t.Fatalf("expected other holder to read old data, got %#v", data)
 	}
-	err = otherUnlock(&Data{Value: "fresh"})
+	err = otherUnlock(ctx, &Data{Value: "fresh"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +384,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 		if result.data.Value != "fresh" {
 			t.Fatalf("expected fresh data from successful acquisition, got %q", result.data.Value)
 		}
-		err = result.unlock(result.data)
+		err = result.unlock(ctx, result.data)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -395,6 +395,262 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 
 type retryCheckClient struct {
 	attempts int32
+}
+
+type providedContextClient struct {
+	putItems int32
+}
+
+func (c *providedContextClient) Do(req *http.Request) (*http.Response, error) {
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
+	switch req.Header.Get("X-Amz-Target") {
+	case "DynamoDB_20120810.UpdateItem":
+	case "DynamoDB_20120810.PutItem":
+		atomic.AddInt32(&c.putItems, 1)
+	default:
+		return nil, fmt.Errorf("unexpected dynamodb operation: %s", req.Header.Get("X-Amz-Target"))
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header: http.Header{
+			"Content-Type":     []string{"application/x-amz-json-1.0"},
+			"X-Amzn-Requestid": []string{"test-request-id"},
+		},
+		Body:    io.NopCloser(strings.NewReader(`{}`)),
+		Request: req,
+	}, nil
+}
+
+func TestReturnedFunctionsUseProvidedContext(t *testing.T) {
+	originalClient := dynamoDBClient
+	t.Cleanup(func() { dynamoDBClient = originalClient })
+
+	testClient := &providedContextClient{}
+	dynamoDBClient = func() *dynamodb.Client {
+		return dynamodb.New(dynamodb.Options{
+			Region: "us-east-1",
+			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
+			}),
+			HTTPClient: testClient,
+		})
+	}
+
+	lockCtx, cancelLock := context.WithCancel(context.Background())
+	unlock, update, _, err := Lock[Data](lockCtx, &LockInput{
+		Table:             "provided-context",
+		ID:                "provided-context",
+		HeartbeatMaxAge:   2 * time.Hour,
+		HeartbeatInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelLock()
+
+	callCtx := context.Background()
+	err = update(callCtx, &Data{Value: "update"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = unlock(callCtx, &Data{Value: "unlock"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&testClient.putItems); got != 2 {
+		t.Fatalf("expected update and unlock PutItem calls, got %d", got)
+	}
+}
+
+type releaseHeartbeatClient struct {
+	updateItems                  int32
+	releaseStarted               chan struct{}
+	heartbeatDuringRelease       chan struct{}
+	signalReleaseStarted         func()
+	signalHeartbeatDuringRelease func()
+}
+
+func newReleaseHeartbeatClient() *releaseHeartbeatClient {
+	client := &releaseHeartbeatClient{
+		releaseStarted:         make(chan struct{}),
+		heartbeatDuringRelease: make(chan struct{}),
+	}
+	client.signalReleaseStarted = sync.OnceFunc(func() { close(client.releaseStarted) })
+	client.signalHeartbeatDuringRelease = sync.OnceFunc(func() { close(client.heartbeatDuringRelease) })
+	return client
+}
+
+func (c *releaseHeartbeatClient) Do(req *http.Request) (*http.Response, error) {
+	response := func() *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header: http.Header{
+				"Content-Type":     []string{"application/x-amz-json-1.0"},
+				"X-Amzn-Requestid": []string{"test-request-id"},
+			},
+			Body:    io.NopCloser(strings.NewReader(`{}`)),
+			Request: req,
+		}
+	}
+
+	switch req.Header.Get("X-Amz-Target") {
+	case "DynamoDB_20120810.UpdateItem":
+		if atomic.AddInt32(&c.updateItems, 1) > 1 {
+			select {
+			case <-c.releaseStarted:
+				c.signalHeartbeatDuringRelease()
+			default:
+			}
+		}
+		return response(), nil
+	case "DynamoDB_20120810.PutItem":
+		c.signalReleaseStarted()
+		select {
+		case <-c.heartbeatDuringRelease:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(time.Second):
+			return nil, fmt.Errorf("timed out waiting for heartbeat during release")
+		}
+		return response(), nil
+	default:
+		return nil, fmt.Errorf("unexpected dynamodb operation: %s", req.Header.Get("X-Amz-Target"))
+	}
+}
+
+func TestUnlockKeepsHeartbeatUntilReleaseSucceeds(t *testing.T) {
+	originalClient := dynamoDBClient
+	t.Cleanup(func() { dynamoDBClient = originalClient })
+
+	testClient := newReleaseHeartbeatClient()
+	dynamoDBClient = func() *dynamodb.Client {
+		return dynamodb.New(dynamodb.Options{
+			Region: "us-east-1",
+			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
+			}),
+			HTTPClient: testClient,
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	unlock, _, _, err := Lock[Data](ctx, &LockInput{
+		Table:             "release-heartbeat",
+		ID:                "release-heartbeat",
+		HeartbeatMaxAge:   time.Second,
+		HeartbeatInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = unlock(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type retryReleaseClient struct {
+	updateItems                 int32
+	putItems                    int32
+	releaseFailed               chan struct{}
+	heartbeatAfterReleaseFailed chan struct{}
+	signalReleaseFailed         func()
+	signalHeartbeatAfterFailure func()
+}
+
+func newRetryReleaseClient() *retryReleaseClient {
+	client := &retryReleaseClient{
+		releaseFailed:               make(chan struct{}),
+		heartbeatAfterReleaseFailed: make(chan struct{}),
+	}
+	client.signalReleaseFailed = sync.OnceFunc(func() { close(client.releaseFailed) })
+	client.signalHeartbeatAfterFailure = sync.OnceFunc(func() { close(client.heartbeatAfterReleaseFailed) })
+	return client
+}
+
+func (c *retryReleaseClient) Do(req *http.Request) (*http.Response, error) {
+	response := func() *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header: http.Header{
+				"Content-Type":     []string{"application/x-amz-json-1.0"},
+				"X-Amzn-Requestid": []string{"test-request-id"},
+			},
+			Body:    io.NopCloser(strings.NewReader(`{}`)),
+			Request: req,
+		}
+	}
+
+	switch req.Header.Get("X-Amz-Target") {
+	case "DynamoDB_20120810.UpdateItem":
+		if atomic.AddInt32(&c.updateItems, 1) > 1 {
+			select {
+			case <-c.releaseFailed:
+				c.signalHeartbeatAfterFailure()
+			default:
+			}
+		}
+		return response(), nil
+	case "DynamoDB_20120810.PutItem":
+		if atomic.AddInt32(&c.putItems, 1) == 1 {
+			c.signalReleaseFailed()
+			return nil, fmt.Errorf("temporary release failure")
+		}
+		return response(), nil
+	default:
+		return nil, fmt.Errorf("unexpected dynamodb operation: %s", req.Header.Get("X-Amz-Target"))
+	}
+}
+
+func TestUnlockFailureKeepsHeartbeatAndAllowsRetry(t *testing.T) {
+	originalClient := dynamoDBClient
+	t.Cleanup(func() { dynamoDBClient = originalClient })
+
+	testClient := newRetryReleaseClient()
+	dynamoDBClient = func() *dynamodb.Client {
+		return dynamodb.New(dynamodb.Options{
+			Region: "us-east-1",
+			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
+			}),
+			HTTPClient: testClient,
+			Retryer:    aws.NopRetryer{},
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	unlock, _, _, err := Lock[Data](ctx, &LockInput{
+		Table:             "release-retry",
+		ID:                "release-retry",
+		HeartbeatMaxAge:   time.Second,
+		HeartbeatInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = unlock(ctx, nil)
+	if err == nil {
+		t.Fatal("expected first unlock to fail")
+	}
+	select {
+	case <-testClient.heartbeatAfterReleaseFailed:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for heartbeat after failed unlock")
+	}
+	err = unlock(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&testClient.putItems); got != 2 {
+		t.Fatalf("expected two release attempts, got %d", got)
+	}
 }
 
 func newRetryCheckDynamoDBClient(c *retryCheckClient) func() *dynamodb.Client {
@@ -507,7 +763,7 @@ func TestData(t *testing.T) {
 	if data != nil {
 		t.Fatal("data not nil")
 	}
-	err = unlock(&testData{Value: "asdf"})
+	err = unlock(ctx, &testData{Value: "asdf"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +790,7 @@ func TestData(t *testing.T) {
 	} else if read.Value != "asdf" {
 		t.Fatal("read mismatch")
 	}
-	err = unlock(&testData{Value: "123"})
+	err = unlock(ctx, &testData{Value: "123"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,7 +808,7 @@ func TestData(t *testing.T) {
 	} else if data.Value != "123" {
 		t.Fatal("data mismatch")
 	}
-	err = unlock(data)
+	err = unlock(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,7 +870,7 @@ func TestPreExistingData(t *testing.T) {
 	if err == nil {
 		t.Fatal("acquired lock twice")
 	}
-	err = unlock(data)
+	err = unlock(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,7 +903,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	}
 	data = &Data{Value: "asdf"}
 	time.Sleep(2 * time.Second)
-	err = update(data)
+	err = update(ctx, data)
 	if err != nil {
 		panic(err)
 	}
@@ -662,7 +918,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	}
 	data.Value = "foo"
 	time.Sleep(2 * time.Second)
-	err = update(data)
+	err = update(ctx, data)
 	if err != nil {
 		panic(err)
 	}
@@ -677,11 +933,11 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	}
 	data.Value = "bar"
 	time.Sleep(2 * time.Second)
-	err = update(data)
+	err = update(ctx, data)
 	if err != nil {
 		panic(err)
 	}
-	err = unlock(data)
+	err = unlock(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +994,7 @@ func TestNullValueDoesNotBreakLocking(t *testing.T) {
 	if data == nil {
 		t.Fatalf("data is nil")
 	}
-	err = unlock(data)
+	err = unlock(ctx, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -817,7 +1073,7 @@ func TestHeartbeatErrorHandling(t *testing.T) {
 	if atomic.LoadInt32(&heartbeatErrors) != 1 {
 		t.Fatalf("expected onHeartbeatErr once, got %d times", heartbeatErrors)
 	}
-	err = unlock(&Data{Value: "asdf"})
+	err = unlock(ctx, &Data{Value: "asdf"})
 	if err == nil {
 		t.Fatalf("should fail, uid changed by sabotage")
 	}
@@ -848,11 +1104,11 @@ func TestUnlockTwiceFails(t *testing.T) {
 	if data != nil {
 		t.Fatalf("data should be nil for new item")
 	}
-	err = unlock(&Data{Value: "temp"})
+	err = unlock(ctx, &Data{Value: "temp"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = unlock(&Data{Value: "temp"})
+	err = unlock(ctx, &Data{Value: "temp"})
 	if err == nil {
 		t.Fatalf("unlock twice should error")
 	}
@@ -879,12 +1135,12 @@ func TestContextCancelBeforeLock(t *testing.T) {
 		HeartbeatInterval: 1 * time.Second,
 	})
 	if err == nil {
-		_ = unlock(nil)
+		_ = unlock(context.Background(), nil)
 		t.Fatal("expected error when context is already canceled")
 	}
 }
 
-func TestContextCancelUnlock(t *testing.T) {
+func TestUnlockUsesProvidedContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	table := getTableName()
 	err := setup(table)
@@ -910,9 +1166,19 @@ func TestContextCancelUnlock(t *testing.T) {
 		t.Fatal("data should be nil for a fresh lock")
 	}
 	cancel()
-	err = unlock(&Data{Value: "test-cancel"})
-	if err == nil {
-		t.Fatal("expected unlock to fail after context cancellation or to effectively no-op")
+	err = unlock(context.Background(), &Data{Value: "test-cancel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := Read[Data](context.Background(), table, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read == nil {
+		t.Fatal("expected data written during unlock")
+	}
+	if read.Value != "test-cancel" {
+		t.Fatalf("expected unlock data, got %q", read.Value)
 	}
 }
 
@@ -938,7 +1204,7 @@ func TestContextCancelExpired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = unlock(nil) }()
+	defer func() { _ = unlock(context.Background(), nil) }()
 	cancel()
 	time.Sleep(5 * time.Second)
 	unlock, _, _, err = Lock[Data](context.Background(), &LockInput{
@@ -950,7 +1216,7 @@ func TestContextCancelExpired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("context was canceled, lock should have expired")
 	}
-	_ = unlock(nil)
+	_ = unlock(context.Background(), nil)
 }
 
 func TestUnlockWithNil(t *testing.T) {
@@ -978,7 +1244,7 @@ func TestUnlockWithNil(t *testing.T) {
 	if data != nil {
 		t.Fatalf("expected nil data for a fresh lock")
 	}
-	err = unlock(nil)
+	err = unlock(ctx, nil)
 	if err != nil {
 		t.Fatalf("expected no error unlocking with nil data, got: %v", err)
 	}
@@ -1019,7 +1285,7 @@ func TestUpdateWithNil(t *testing.T) {
 	if data != nil {
 		t.Fatalf("expected nil data for a fresh lock")
 	}
-	err = update(nil)
+	err = update(ctx, nil)
 	if err != nil {
 		t.Fatalf("expected no error updating with nil data, got: %v", err)
 	}
@@ -1033,9 +1299,24 @@ func TestUpdateWithNil(t *testing.T) {
 	if read.Value != "" {
 		t.Fatalf("expected zero value")
 	}
-	err = unlock(nil)
+	err = unlock(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLockRejectsEqualHeartbeatMaxAgeAndInterval(t *testing.T) {
+	_, _, _, err := Lock[Data](context.Background(), &LockInput{
+		Table:             "validation",
+		ID:                "validation",
+		HeartbeatMaxAge:   time.Second,
+		HeartbeatInterval: time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected heartbeat max age equal to interval to fail")
+	}
+	if !strings.Contains(err.Error(), "heartbeat max age should be greater than heartbeat interval") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -1082,7 +1363,7 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected lock acquisition to succeed after expiration, got: %v", err)
 	}
-	_ = unlock2(nil)
+	_ = unlock2(ctx, nil)
 }
 
 func TestLockFailsAfterExhaustingRetries(t *testing.T) {
