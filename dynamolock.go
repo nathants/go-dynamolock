@@ -35,6 +35,9 @@ type UnlockFn[T any] func(context.Context, *T) error
 
 type UpdateFn[T any] func(context.Context, *T) error
 
+// ErrLockUnavailable reports expected contention or a missing record required by LockInput.
+var ErrLockUnavailable = errors.New("lock is held or required item is missing")
+
 var dynamoDBClient = lib.DynamoDBClient
 
 func clearInternalKeys(data map[string]ddbtypes.AttributeValue) {
@@ -75,6 +78,7 @@ func buildItem[T any](id string, uid string, unix int64, data *T) (map[string]dd
 type LockInput struct {
 	Table             string
 	ID                string
+	RequireExisting   bool
 	HeartbeatMaxAge   time.Duration
 	HeartbeatInterval time.Duration
 	HeartbeatErrFn    func(error)
@@ -138,6 +142,9 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 			Or(expression.AttributeType(expression.Name("uid"), "NULL")).
 			Or(expression.Name("uid").Equal(expression.Value(""))).
 			Or(expression.Name("unix").LessThanEqual(expression.Value(expiredBefore)))
+		if input.RequireExisting {
+			condition = expression.Name("id").AttributeExists().And(condition)
+		}
 
 		expr, err := expression.NewBuilder().
 			WithCondition(condition).
@@ -174,7 +181,7 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 			return nil, nil, nil, err
 		}
 		if retryCount >= input.Retries {
-			err = fmt.Errorf("lock is held: %s %s", input.ID, uid)
+			err = fmt.Errorf("%w: %s %s", ErrLockUnavailable, input.ID, uid)
 			return nil, nil, nil, err
 		}
 		retryCount++

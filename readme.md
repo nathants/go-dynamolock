@@ -28,7 +28,9 @@ Manipulation of external state while the lock is held is subject to concurrent u
 
 In practice, a small `HeartbeatInterval`, a large `HeartbeatMaxAge`, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
 
-When lock contention is expected you can set `Retries` to automatically retry acquiring the lock. Use `RetriesSleep` to control how long to sleep between attempts.
+When lock contention is expected you can set `Retries` to automatically retry acquiring the lock. Use `RetriesSleep` to control how long to sleep between attempts. Exhausted contention returns an error matching `ErrLockUnavailable`.
+
+Set `RequireExisting` when a stale lock request must not create a missing record. A missing required record also returns `ErrLockUnavailable` and leaves the table unchanged.
 
 Prefer to store data within the lock when possible, since those updates use compare and swap.
 

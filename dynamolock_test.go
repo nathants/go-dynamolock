@@ -2,6 +2,7 @@ package dynamolock
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -653,6 +654,72 @@ func TestUnlockFailureKeepsHeartbeatAndAllowsRetry(t *testing.T) {
 	}
 }
 
+type requireExistingClient struct {
+	condition string
+	names     map[string]string
+}
+
+func (c *requireExistingClient) Do(req *http.Request) (*http.Response, error) {
+	var body struct {
+		ConditionExpression      string            `json:"ConditionExpression"`
+		ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	c.condition = body.ConditionExpression
+	c.names = body.ExpressionAttributeNames
+	responseBody := `{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"conditional failed"}`
+	return &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Status:     "400 Bad Request",
+		Header: http.Header{
+			"Content-Type":     []string{"application/x-amz-json-1.0"},
+			"X-Amzn-Requestid": []string{"test-request-id"},
+		},
+		Body:    io.NopCloser(strings.NewReader(responseBody)),
+		Request: req,
+	}, nil
+}
+
+func TestLockRequireExistingMakesCreationConditionallyImpossible(t *testing.T) {
+	originalClient := dynamoDBClient
+	t.Cleanup(func() { dynamoDBClient = originalClient })
+	testClient := &requireExistingClient{}
+	dynamoDBClient = func() *dynamodb.Client {
+		return dynamodb.New(dynamodb.Options{
+			Region: "us-east-1",
+			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
+			}),
+			HTTPClient: testClient,
+		})
+	}
+
+	_, _, _, err := Lock[Data](context.Background(), &LockInput{
+		Table:             "require-existing",
+		ID:                "missing-record",
+		RequireExisting:   true,
+		HeartbeatMaxAge:   30 * time.Second,
+		HeartbeatInterval: time.Second,
+	})
+	if !errors.Is(err, ErrLockUnavailable) {
+		t.Fatalf("expected unavailable missing record, got: %v", err)
+	}
+	if !strings.Contains(testClient.condition, "attribute_exists") {
+		t.Fatalf("acquisition condition can create a missing record: %q", testClient.condition)
+	}
+	idReferenced := false
+	for placeholder, name := range testClient.names {
+		if name == "id" && strings.Contains(testClient.condition, placeholder) {
+			idReferenced = true
+		}
+	}
+	if !idReferenced {
+		t.Fatalf("required-existence condition does not reference the primary ID: condition=%q names=%v", testClient.condition, testClient.names)
+	}
+}
+
 func newRetryCheckDynamoDBClient(c *retryCheckClient) func() *dynamodb.Client {
 	return func() *dynamodb.Client {
 		return dynamodb.New(dynamodb.Options{
@@ -702,8 +769,8 @@ func assertRetryAttempts(t *testing.T, retries int, retriesSleep time.Duration) 
 	if err == nil {
 		t.Fatal("expected lock acquisition to fail")
 	}
-	if !strings.Contains(err.Error(), "lock is held") {
-		t.Fatalf("expected 'lock is held' error, got: %v", err)
+	if !errors.Is(err, ErrLockUnavailable) {
+		t.Fatalf("expected ErrLockUnavailable, got: %v", err)
 	}
 	want := int32(retries + 1)
 	if got := atomic.LoadInt32(&checkClient.attempts); got != want {
