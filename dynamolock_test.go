@@ -655,20 +655,25 @@ func TestUnlockFailureKeepsHeartbeatAndAllowsRetry(t *testing.T) {
 }
 
 type requireExistingClient struct {
-	condition string
-	names     map[string]string
+	condition       string
+	names           map[string]string
+	returnOnFailure string
+	attempts        int32
 }
 
 func (c *requireExistingClient) Do(req *http.Request) (*http.Response, error) {
+	atomic.AddInt32(&c.attempts, 1)
 	var body struct {
-		ConditionExpression      string            `json:"ConditionExpression"`
-		ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
+		ConditionExpression                 string            `json:"ConditionExpression"`
+		ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
+		ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		return nil, err
 	}
 	c.condition = body.ConditionExpression
 	c.names = body.ExpressionAttributeNames
+	c.returnOnFailure = body.ReturnValuesOnConditionCheckFailure
 	responseBody := `{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"conditional failed"}`
 	return &http.Response{
 		StatusCode: http.StatusBadRequest,
@@ -702,9 +707,20 @@ func TestLockRequireExistingMakesCreationConditionallyImpossible(t *testing.T) {
 		RequireExisting:   true,
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
+		Retries:           2,
+		RetriesSleep:      time.Nanosecond,
 	})
+	if !errors.Is(err, ErrLockNotFound) {
+		t.Fatalf("expected ErrLockNotFound, got: %v", err)
+	}
 	if !errors.Is(err, ErrLockUnavailable) {
-		t.Fatalf("expected unavailable missing record, got: %v", err)
+		t.Fatalf("expected ErrLockNotFound to also match ErrLockUnavailable, got: %v", err)
+	}
+	if got := atomic.LoadInt32(&testClient.attempts); got != 1 {
+		t.Fatalf("expected a missing required record to stop without retry, got %d attempts", got)
+	}
+	if testClient.returnOnFailure != string(types.ReturnValuesOnConditionCheckFailureAllOld) {
+		t.Fatalf("expected failed acquisition to return the existing item, got %q", testClient.returnOnFailure)
 	}
 	if !strings.Contains(testClient.condition, "attribute_exists") {
 		t.Fatalf("acquisition condition can create a missing record: %q", testClient.condition)
@@ -769,8 +785,17 @@ func assertRetryAttempts(t *testing.T, retries int, retriesSleep time.Duration) 
 	if err == nil {
 		t.Fatal("expected lock acquisition to fail")
 	}
+	if !errors.Is(err, ErrLockHeld) {
+		t.Fatalf("expected ErrLockHeld, got: %v", err)
+	}
 	if !errors.Is(err, ErrLockUnavailable) {
-		t.Fatalf("expected ErrLockUnavailable, got: %v", err)
+		t.Fatalf("expected ErrLockHeld to also match ErrLockUnavailable, got: %v", err)
+	}
+	if errors.Is(err, ErrLockNotFound) {
+		t.Fatalf("lock contention incorrectly matched ErrLockNotFound: %v", err)
+	}
+	if !strings.Contains(err.Error(), "lock is held") {
+		t.Fatalf("expected lock contention context, got: %v", err)
 	}
 	want := int32(retries + 1)
 	if got := atomic.LoadInt32(&checkClient.attempts); got != want {
@@ -877,6 +902,95 @@ func TestData(t *testing.T) {
 	}
 	err = unlock(ctx, data)
 	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLockRequireExisting(t *testing.T) {
+	ctx := context.Background()
+	table := getTableName()
+	if err := setup(table); err != nil {
+		t.Fatal(err)
+	}
+	defer teardown(table)
+	if err := lib.DynamoDBWaitForReady(ctx, table); err != nil {
+		t.Fatal(err)
+	}
+
+	id := "require-existing"
+	_, _, _, err := Lock[Data](ctx, &LockInput{
+		Table:             table,
+		ID:                id,
+		RequireExisting:   true,
+		HeartbeatMaxAge:   30 * time.Second,
+		HeartbeatInterval: time.Second,
+		Retries:           2,
+		RetriesSleep:      time.Nanosecond,
+	})
+	if !errors.Is(err, ErrLockNotFound) {
+		t.Fatalf("expected ErrLockNotFound, got: %v", err)
+	}
+	if !errors.Is(err, ErrLockUnavailable) {
+		t.Fatalf("expected missing item to also match ErrLockUnavailable, got: %v", err)
+	}
+	if errors.Is(err, ErrLockHeld) {
+		t.Fatalf("missing item incorrectly matched ErrLockHeld: %v", err)
+	}
+	data, err := Read[Data](ctx, table, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data != nil {
+		t.Fatalf("required acquisition created missing item: %#v", data)
+	}
+
+	unlock, _, data, err := Lock[Data](ctx, &LockInput{
+		Table:             table,
+		ID:                id,
+		HeartbeatMaxAge:   30 * time.Second,
+		HeartbeatInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data != nil {
+		t.Fatalf("default acquisition returned data for a missing item: %#v", data)
+	}
+	if err := unlock(ctx, &Data{Value: "existing"}); err != nil {
+		t.Fatal(err)
+	}
+
+	unlock, _, data, err = Lock[Data](ctx, &LockInput{
+		Table:             table,
+		ID:                id,
+		RequireExisting:   true,
+		HeartbeatMaxAge:   30 * time.Second,
+		HeartbeatInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data == nil || data.Value != "existing" {
+		t.Fatalf("required acquisition returned wrong existing data: %#v", data)
+	}
+
+	_, _, _, err = Lock[Data](ctx, &LockInput{
+		Table:             table,
+		ID:                id,
+		RequireExisting:   true,
+		HeartbeatMaxAge:   30 * time.Second,
+		HeartbeatInterval: time.Second,
+	})
+	if !errors.Is(err, ErrLockHeld) {
+		t.Fatalf("expected held item to match ErrLockHeld, got: %v", err)
+	}
+	if !errors.Is(err, ErrLockUnavailable) {
+		t.Fatalf("expected held item to also match ErrLockUnavailable, got: %v", err)
+	}
+	if errors.Is(err, ErrLockNotFound) {
+		t.Fatalf("held item incorrectly matched ErrLockNotFound: %v", err)
+	}
+	if err := unlock(ctx, data); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -28,9 +28,11 @@ Manipulation of external state while the lock is held is subject to concurrent u
 
 In practice, a small `HeartbeatInterval`, a large `HeartbeatMaxAge`, and reasonable clock drift should be [safe](https://en.wikipedia.org/wiki/Lease_(computer_science)).
 
-When lock contention is expected you can set `Retries` to automatically retry acquiring the lock. Use `RetriesSleep` to control how long to sleep between attempts. Exhausted contention returns an error matching `ErrLockUnavailable`.
+When lock contention is expected you can set `Retries` to automatically retry acquiring the lock. Use `RetriesSleep` to control how long to sleep between attempts. Exhausted contention returns an error matching `ErrLockHeld`.
 
-Set `RequireExisting` when a stale lock request must not create a missing record. A missing required record also returns `ErrLockUnavailable` and leaves the table unchanged.
+Set `RequireExisting` when a stale lock request must not create a missing record. A missing required record immediately returns `ErrLockNotFound` without consuming retries and leaves the table unchanged. This checks existence at acquisition time; it does not identify an item incarnation across deletion and recreation.
+
+Both `ErrLockHeld` and `ErrLockNotFound` also match their parent `ErrLockUnavailable`. Match a child when the causes require different handling, or match the parent to handle every expected acquisition failure alike.
 
 Prefer to store data within the lock when possible, since those updates use compare and swap.
 

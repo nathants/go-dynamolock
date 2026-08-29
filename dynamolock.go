@@ -35,8 +35,16 @@ type UnlockFn[T any] func(context.Context, *T) error
 
 type UpdateFn[T any] func(context.Context, *T) error
 
-// ErrLockUnavailable reports expected contention or a missing record required by LockInput.
-var ErrLockUnavailable = errors.New("lock is held or required item is missing")
+// ErrLockUnavailable classifies all expected failures to acquire a lock.
+var ErrLockUnavailable = errors.New("lock unavailable")
+
+// ErrLockNotFound reports that RequireExisting prevented creation of a missing item.
+// It also matches ErrLockUnavailable.
+var ErrLockNotFound = fmt.Errorf("%w: required item is missing", ErrLockUnavailable)
+
+// ErrLockHeld reports contention after the configured acquisition retries are exhausted.
+// It also matches ErrLockUnavailable.
+var ErrLockHeld = fmt.Errorf("%w: lock is held", ErrLockUnavailable)
 
 var dynamoDBClient = lib.DynamoDBClient
 
@@ -155,7 +163,7 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 		if err != nil {
 			return err
 		}
-		updateOut, err := dynamoDBClient().UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		updateInput := &dynamodb.UpdateItemInput{
 			TableName:                 aws.String(input.Table),
 			Key:                       key,
 			ConditionExpression:       expr.Condition(),
@@ -163,7 +171,11 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 			ExpressionAttributeValues: expr.Values(),
 			ExpressionAttributeNames:  expr.Names(),
 			ReturnValues:              ddbtypes.ReturnValueAllOld,
-		})
+		}
+		if input.RequireExisting {
+			updateInput.ReturnValuesOnConditionCheckFailure = ddbtypes.ReturnValuesOnConditionCheckFailureAllOld
+		}
+		updateOut, err := dynamoDBClient().UpdateItem(ctx, updateInput)
 		if err != nil {
 			return fmt.Errorf("failed to acquire the lock: %w", err)
 		}
@@ -177,11 +189,15 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 		if err == nil {
 			break
 		}
-		if !isConditionalCheckFailed(err) {
+		conditionErr, ok := asConditionalCheckFailed(err)
+		if !ok {
 			return nil, nil, nil, err
 		}
+		if input.RequireExisting && len(conditionErr.Item) == 0 {
+			return nil, nil, nil, fmt.Errorf("%w: %s", ErrLockNotFound, input.ID)
+		}
 		if retryCount >= input.Retries {
-			err = fmt.Errorf("%w: %s %s", ErrLockUnavailable, input.ID, uid)
+			err = fmt.Errorf("%w: %s %s", ErrLockHeld, input.ID, uid)
 			return nil, nil, nil, err
 		}
 		retryCount++
@@ -230,9 +246,15 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 	return unlock, update, data, nil
 }
 
+func asConditionalCheckFailed(err error) (*ddbtypes.ConditionalCheckFailedException, bool) {
+	var conditionErr *ddbtypes.ConditionalCheckFailedException
+	ok := errors.As(err, &conditionErr)
+	return conditionErr, ok
+}
+
 func isConditionalCheckFailed(err error) bool {
-	var condErr *ddbtypes.ConditionalCheckFailedException
-	return errors.As(err, &condErr)
+	_, ok := asConditionalCheckFailed(err)
+	return ok
 }
 
 func updateLocked[T any](ctx context.Context, input *LockInput, uid string, data *T) error {
