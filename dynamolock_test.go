@@ -13,6 +13,7 @@ import (
 
 	"math/rand"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -24,16 +25,47 @@ import (
 	"github.com/nathants/libaws/lib"
 )
 
-func checkAccount() {
+func checkAccount(t *testing.T) {
+	t.Helper()
 	_ = rand.Float32
 	_ = attributevalue.Marshal
 	_ = strings.Replace
-	account, err := lib.StsAccount(context.Background())
-	if err != nil {
-		panic(err)
+	expected := os.Getenv("DYNAMOLOCK_TEST_ACCOUNT")
+	if expected == "" {
+		t.Skip("DYNAMOLOCK_TEST_ACCOUNT is not set; skipping live AWS test")
 	}
-	if os.Getenv("DYNAMOLOCK_TEST_ACCOUNT") != account {
-		panic(fmt.Sprintf("%s != %s", os.Getenv("DYNAMOLOCK_TEST_ACCOUNT"), account))
+	account, err := lib.StsAccount(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expected != account {
+		t.Fatalf("%s != %s", expected, account)
+	}
+}
+
+func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
+	const helper = "DYNAMOLOCK_TEST_UNARMED_HELPER"
+	if os.Getenv(helper) == "1" {
+		checkAccount(t)
+		return
+	}
+
+	t.Setenv("DYNAMOLOCK_TEST_ACCOUNT", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_DEFAULT_REGION", "us-west-2")
+	t.Setenv("AWS_REGION", "us-west-2")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:1")
+	t.Setenv("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1")
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestUnarmedLiveGateSkipsBeforeProvider$")
+	cmd.Env = append(os.Environ(), helper+"=1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("unarmed live test reached the provider: %v\n%s", err, output)
 	}
 }
 
@@ -135,8 +167,9 @@ func Uid() string {
 	return uuid.Must(uuid.NewV4()).String()
 }
 
-func setup(table string) error {
-	checkAccount()
+func setup(t *testing.T, table string) error {
+	t.Helper()
+	checkAccount(t)
 	input := &dynamodb.CreateTableInput{
 		TableName:   aws.String(table),
 		BillingMode: types.BillingModePayPerRequest,
@@ -173,7 +206,7 @@ func setup(table string) error {
 func TestBasic(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +247,7 @@ func TestReadModifyWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +318,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -833,7 +866,7 @@ func (c lockAcquireDelayClient) Do(req *http.Request) (*http.Response, error) {
 func TestData(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -909,7 +942,7 @@ func TestData(t *testing.T) {
 func TestLockRequireExisting(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	if err := setup(table); err != nil {
+	if err := setup(t, table); err != nil {
 		t.Fatal(err)
 	}
 	defer teardown(table)
@@ -1004,7 +1037,7 @@ type preExistingData struct {
 func TestPreExistingData(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1060,7 +1093,7 @@ func TestPreExistingData(t *testing.T) {
 func TestWriteWithoutUnlocking(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1143,7 +1176,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 func TestNullValueDoesNotBreakLocking(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1184,7 +1217,7 @@ func TestNullValueDoesNotBreakLocking(t *testing.T) {
 func TestHeartbeatErrorHandling(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1263,7 +1296,7 @@ func TestHeartbeatErrorHandling(t *testing.T) {
 func TestUnlockTwiceFails(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1299,7 +1332,7 @@ func TestContextCancelBeforeLock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1324,7 +1357,7 @@ func TestContextCancelBeforeLock(t *testing.T) {
 func TestUnlockUsesProvidedContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1366,7 +1399,7 @@ func TestUnlockUsesProvidedContext(t *testing.T) {
 func TestContextCancelExpired(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1403,7 +1436,7 @@ func TestContextCancelExpired(t *testing.T) {
 func TestUnlockWithNil(t *testing.T) {
 	ctx := context.Background()
 	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1444,7 +1477,7 @@ func TestUnlockWithNil(t *testing.T) {
 func TestUpdateWithNil(t *testing.T) {
 	ctx := context.Background()
 	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1508,7 +1541,7 @@ func TestLockRetriesWhenHeldNotExpired(t *testing.T) {
 func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	ctx := context.Background()
 	table := getTableName()
-	err := setup(table)
+	err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
