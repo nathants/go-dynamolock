@@ -769,7 +769,33 @@ func TestLockRequireExistingMakesCreationConditionallyImpossible(t *testing.T) {
 	}
 }
 
-func newRetryCheckDynamoDBClient(c *retryCheckClient) func() *dynamodb.Client {
+func TestLockExpirationDoesNotIncludeRoundedBoundary(t *testing.T) {
+	originalClient := dynamoDBClient
+	t.Cleanup(func() { dynamoDBClient = originalClient })
+	checkClient := &requireExistingClient{}
+	dynamoDBClient = newRetryCheckDynamoDBClient(checkClient)
+
+	_, _, _, err := Lock[Data](t.Context(), &LockInput{
+		Table:             "expiration-boundary",
+		ID:                "expiration-boundary",
+		HeartbeatMaxAge:   100 * time.Millisecond,
+		HeartbeatInterval: 40 * time.Millisecond,
+	})
+	if !errors.Is(err, ErrLockHeld) {
+		t.Fatalf("expected scripted contention, got: %v", err)
+	}
+
+	// A heartbeat late in a second can equal floor(now - max age) while
+	// still fresh. Assert the actual request excludes that rounded boundary.
+	for placeholder, name := range checkClient.names {
+		if name == "unix" && strings.Contains(checkClient.condition, placeholder+" < ") {
+			return
+		}
+	}
+	t.Fatalf("expiration must use a strict timestamp comparison, got: %q", checkClient.condition)
+}
+
+func newRetryCheckDynamoDBClient(c dynamodb.HTTPClient) func() *dynamodb.Client {
 	return func() *dynamodb.Client {
 		return dynamodb.New(dynamodb.Options{
 			Region: "us-east-1",

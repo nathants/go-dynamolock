@@ -149,7 +149,7 @@ func Lock[T any](ctx context.Context, input *LockInput) (UnlockFn[T], UpdateFn[T
 		condition := expression.Name("uid").AttributeNotExists().
 			Or(expression.AttributeType(expression.Name("uid"), "NULL")).
 			Or(expression.Name("uid").Equal(expression.Value(""))).
-			Or(expression.Name("unix").LessThanEqual(expression.Value(expiredBefore)))
+			Or(expression.Name("unix").LessThan(expression.Value(expiredBefore)))
 		if input.RequireExisting {
 			condition = expression.Name("id").AttributeExists().And(condition)
 		}
