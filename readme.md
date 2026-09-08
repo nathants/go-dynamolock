@@ -157,9 +157,15 @@ func update(ctx context.Context, client *dynamodb.Client) (err error) {
 
 ## Tests
 
-`GOTOOLCHAIN=local go test -race -timeout=2m ./...` runs offline by default. The
-protocol tests inspect actual AWS SDK requests and inject responses; they are
-not a replacement DynamoDB implementation.
+From the repository root, `bash bin/check.sh` checks formatting, runs analysis,
+and runs the offline race tests. It fails if a required tool is missing; it
+never installs tools or rewrites formatting. Advisory lint stages are labeled.
+
+`bash test.sh` runs tests alone, uncached, with the race detector and a two-minute
+timeout. Additional `go test` flags are forwarded, for example
+`bash test.sh -run '^TestProtocol'`. Both scripts use `GOTOOLCHAIN=local`.
+The protocol tests inspect actual AWS SDK requests and inject responses; they
+are not a replacement DynamoDB implementation.
 
 Live tests require `DYNAMOLOCK_TEST_ACCOUNT` to match STS before mutation. Run
 `go test -race -run '^TestLeaseAWS$' -count=1 -timeout=5m` for real conditions,

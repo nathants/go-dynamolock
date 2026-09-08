@@ -39,10 +39,12 @@ Read [readme.md](readme.md) before changing the lease protocol or public API.
 
 Use installed Go 1.27 with `GOTOOLCHAIN=local`.
 
-- Offline: `DYNAMOLOCK_TEST_ACCOUNT= go test -race -count=1 -timeout=2m ./...`.
-- Existing gate: `bash bin/check.sh`. Its missing-tool branches install software,
-  so first verify every tool is present; do not use it for implicit installation.
-  The go-hasdefer/go-hasdefault/golint stages remain advisory.
+- Offline tests: `bash test.sh` runs uncached race tests with a two-minute
+  timeout and accepts additional `go test` flags. It uses `GOTOOLCHAIN=local`.
+- Gate: `bash bin/check.sh`, from the repository root. It requires all tools on
+  PATH, never installs them, checks formatting without rewriting files, and runs
+  analysis plus explicitly disarmed offline tests. Tool versions are supplied by
+  the environment; go-hasdefer/go-hasdefault/golint are labeled advisory.
 - Live: `DYNAMOLOCK_TEST_ACCOUNT=EXPECTED_ACCOUNT go test -race -run '^TestLeaseAWS$' -count=1 -timeout=5m`.
   The expected account must be independently known and match STS before mutation.
   The unarmed gate must skip before accessing credentials or AWS providers.

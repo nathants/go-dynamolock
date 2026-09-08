@@ -1,38 +1,46 @@
 #!/bin/bash
-set -eou pipefail
+set -euo pipefail
+export GOTOOLCHAIN=local
 
-which staticcheck >/dev/null   || (cd ~ && go install honnef.co/go/tools/cmd/staticcheck@latest)
-which golint      >/dev/null   || (cd ~ && go install golang.org/x/lint/golint@latest)
-which ineffassign >/dev/null   || (cd ~ && go install github.com/gordonklaus/ineffassign@latest)
-which errcheck    >/dev/null   || (cd ~ && go install github.com/kisielk/errcheck@latest)
-which bodyclose   >/dev/null   || (cd ~ && go install github.com/timakin/bodyclose@latest)
-which nargs       >/dev/null   || (cd ~ && go install github.com/alexkohler/nargs/cmd/nargs@latest)
-which go-hasdefault >/dev/null || (cd ~ && go install github.com/nathants/go-hasdefault@latest)
-which go-hasdefer >/dev/null   || (cd ~ && go install github.com/nathants/go-hasdefer@latest)
-which govulncheck >/dev/null || (cd ~ && go install golang.org/x/vuln/cmd/govulncheck@latest)
+for tool in bash go gofmt find grep staticcheck golint ineffassign errcheck bodyclose nargs go-hasdefault go-hasdefer govulncheck; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'missing required tool: %s\n' "$tool" >&2
+        exit 1
+    fi
+done
+
+mapfile -d '' -t go_files < <(find . -type f -name '*.go' -print0)
+wait "$!" # Propagate errors from the process substitution.
+if (( ${#go_files[@]} == 0 )); then
+    echo 'no Go files found; run this check from the repository root' >&2
+    exit 1
+fi
+
+echo 'gofmt (check only)'
+if ! unformatted=$(gofmt -l "${go_files[@]}") || [[ -n "$unformatted" ]]; then
+    printf 'gofmt check failed:\n%s\n' "$unformatted" >&2
+    exit 1
+fi
 
 echo govulncheck
 govulncheck ./...
 
-echo go-hasdefer
-go-hasdefer $(find -type f -name "*.go") || true
+echo 'go-hasdefer (advisory)'
+go-hasdefer "${go_files[@]}" || true
 
-echo go-hasdefault
-go-hasdefault $(find -type f -name "*.go") || true
-
-echo go fmt
-go fmt ./... >/dev/null
+echo 'go-hasdefault (advisory)'
+go-hasdefault "${go_files[@]}" || true
 
 echo nargs
 nargs ./...
 
 echo bodyclose
-go vet -vettool=$(which bodyclose) ./...
+go vet -vettool="$(command -v bodyclose)" ./...
 
-echo go lint
+echo 'golint (advisory)'
 golint ./... | grep -v -e unexported -e "should be" || true
 
-echo static check
+echo staticcheck
 staticcheck ./...
 
 echo ineffassign
@@ -41,5 +49,8 @@ ineffassign ./...
 echo errcheck
 errcheck ./...
 
-echo go vet
+echo 'go vet'
 go vet ./...
+
+echo 'go test (offline)'
+DYNAMOLOCK_TEST_ACCOUNT= bash test.sh

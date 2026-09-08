@@ -1,3 +1,4 @@
-go test ./... -v -race -o ./test -c && ./test -test.v
-# go test ./... -v -race -o ./test -c && REUSE=y ./test -test.v
-# go test ./... -v -race -o ./test -c && REUSE=y ./test -test.v -test.run ^TestLockExpiration$
+#!/bin/bash
+set -euo pipefail
+
+GOTOOLCHAIN=local exec go test ./... -v -race -count=1 -timeout=2m "$@"
