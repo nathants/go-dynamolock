@@ -44,3 +44,5 @@ Use installed Go 1.27 with `GOTOOLCHAIN=local`.
 - Protocol tests use the real AWS SDK with scripted HTTP responses, not a second
   implementation of DynamoDB conditions. Live tests exercise real conditions and
   deliberately lost responses. Preserve both kinds of evidence.
+- `TestReadModifyWrite` asserts a persisted counter under contention, retries
+  only ErrLockHeld, and joins workers before table cleanup.

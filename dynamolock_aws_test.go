@@ -251,25 +251,32 @@ func TestBasic(t *testing.T) {
 }
 
 func TestReadModifyWrite(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	type counter struct {
+		Count int `dynamodbav:"count"`
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	table := getTableName()
 	client, err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer teardown(client, table)
+	t.Cleanup(func() { teardown(client, table) })
 	err = waitForTable(ctx, client, table)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := Uid()
 	max := 50
-	var sum int32
 	var inCriticalSection int32
 	done := make(chan error, max)
+	var workers sync.WaitGroup
+	defer func() {
+		cancel()
+		workers.Wait()
+	}()
 	for range max {
-		go func() {
+		workers.Go(func() {
 			for {
 				select {
 				case <-ctx.Done():
@@ -277,7 +284,7 @@ func TestReadModifyWrite(t *testing.T) {
 					return
 				default:
 				}
-				unlock, _, err := Lock[Data](ctx, client, &LockInput{
+				lease, data, err := Lock[counter](ctx, client, &LockInput{
 					Table:             table,
 					ID:                id,
 					HeartbeatMaxAge:   time.Second * 5,
@@ -285,35 +292,37 @@ func TestReadModifyWrite(t *testing.T) {
 					Retries:           5,
 					RetriesSleep:      1 * time.Second,
 				})
-				if err != nil {
+				if errors.Is(err, ErrLockHeld) {
 					continue
 				}
-				if !atomic.CompareAndSwapInt32(&inCriticalSection, 0, 1) {
-					_ = unlock.Release(ctx)
-					done <- fmt.Errorf("lock allowed concurrent critical sections")
-					return
-				}
-				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
-				newSum := atomic.AddInt32(&sum, 1)
-				t.Log("releasing lock, sum:", newSum)
-				atomic.StoreInt32(&inCriticalSection, 0)
-				err = unlock.Release(ctx)
 				if err != nil {
 					done <- err
 					return
 				}
-				done <- nil
+				cleanupLease(t, lease)
+				if !atomic.CompareAndSwapInt32(&inCriticalSection, 0, 1) {
+					done <- fmt.Errorf("lock allowed concurrent critical sections")
+					return
+				}
+				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
+				if data == nil {
+					data = &counter{}
+				}
+				data.Count++
+				atomic.StoreInt32(&inCriticalSection, 0)
+				done <- lease.Commit(lease.Context(), data)
 				return
 			}
-		}()
+		})
 	}
 	for range max {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got := atomic.LoadInt32(&sum); got != int32(max) {
-		t.Errorf("expected %d, got %d", max, got)
+	stored, err := Read[counter](ctx, client, table, id)
+	if err != nil || stored == nil || stored.Count != max {
+		t.Fatalf("persisted counter = %#v, err = %v; want %d", stored, err, max)
 	}
 }
 
@@ -672,12 +681,16 @@ func TestPreExistingData(t *testing.T) {
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
-	if err == nil {
-		t.Fatal("acquired lock twice")
+	if !errors.Is(err, ErrLockHeld) {
+		t.Fatalf("contending acquisition = %v, want ErrLockHeld", err)
 	}
 	err = unlock.Commit(ctx, data)
 	if err != nil {
 		t.Fatal(err)
+	}
+	stored, err := Read[preExistingData](ctx, client, table, id)
+	if err != nil || stored == nil || stored.ID != id || stored.Value != "test-value" {
+		t.Fatalf("commit did not preserve the pre-existing payload: %#v %v", stored, err)
 	}
 }
 
@@ -826,19 +839,22 @@ func TestContextCancelBeforeLock(t *testing.T) {
 }
 
 func TestContextCancelExpired(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
 	table := getTableName()
 	client, err := setup(t, table)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer teardown(client, table)
-	err = waitForTable(context.Background(), client, table)
+	t.Cleanup(func() { teardown(client, table) })
+	err = waitForTable(ctx, client, table)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := Uid()
-	unlock, _, err := Lock[Data](ctx, client, &LockInput{
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+	first, _, err := Lock[Data](firstCtx, client, &LockInput{
 		Table:             table,
 		ID:                id,
 		HeartbeatMaxAge:   3 * time.Second,
@@ -847,19 +863,49 @@ func TestContextCancelExpired(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = unlock.Release(context.Background()) }()
-	cancel()
+	cleanupLease(t, first)
+	if err := first.Update(first.Context(), &Data{Value: "original"}); err != nil {
+		t.Fatal(err)
+	}
+	cancelFirst()
+	await(t, first.done)
 	time.Sleep(5 * time.Second)
-	unlock, _, err = Lock[Data](context.Background(), client, &LockInput{
+	second, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
 		HeartbeatMaxAge:   3 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("context was canceled, lock should have expired")
+		t.Fatalf("context was canceled, lock should have expired: %v", err)
 	}
-	_ = unlock.Release(context.Background())
+	cleanupLease(t, second)
+	if data == nil || data.Value != "original" {
+		t.Fatalf("takeover changed the stored payload: %#v", data)
+	}
+	if err := second.Update(second.Context(), &Data{Value: "successor"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Update(ctx, &Data{Value: "stale"}); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale Update = %v, want ErrLeaseLost", err)
+	}
+	if err := first.Commit(ctx, &Data{Value: "stale"}); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale Commit = %v, want ErrLeaseLost", err)
+	}
+	if err := first.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := Read[Data](ctx, client, table, id)
+	if err != nil || stored == nil || stored.Value != "successor" {
+		t.Fatalf("stale handle changed the successor's payload: %#v %v", stored, err)
+	}
+	if err := second.Commit(second.Context(), &Data{Value: "committed"}); err != nil {
+		t.Fatalf("stale cleanup disturbed successor ownership: %v", err)
+	}
+	stored, err = Read[Data](ctx, client, table, id)
+	if err != nil || stored == nil || stored.Value != "committed" {
+		t.Fatalf("successor commit did not persist: %#v %v", stored, err)
+	}
 }
 
 func TestCommitEmptyData(t *testing.T) {
