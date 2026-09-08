@@ -5,43 +5,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"math/rand"
-	"os"
-	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/gofrs/uuid"
-	"github.com/nathants/libaws/lib"
 )
-
-func checkAccount(t *testing.T) {
-	t.Helper()
-	_ = rand.Float32
-	_ = attributevalue.Marshal
-	_ = strings.Replace
-	expected := os.Getenv("DYNAMOLOCK_TEST_ACCOUNT")
-	if expected == "" {
-		t.Skip("DYNAMOLOCK_TEST_ACCOUNT is not set; skipping live AWS test")
-	}
-	account, err := lib.StsAccount(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if expected != account {
-		t.Fatalf("%s != %s", expected, account)
-	}
-}
 
 func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
 	const helper = "DYNAMOLOCK_TEST_UNARMED_HELPER"
@@ -69,1581 +51,916 @@ func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
 	}
 }
 
-type Data struct {
-	Value string `json:"value" dynamodbav:"value"`
-	// note: you cannot use "id", since it is part of LockKey{}
-	// note: you cannot use "uid" or "unix", since those are part of LockData{}
+type httpFunc func(*http.Request) (*http.Response, error)
+
+func (f httpFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+type wireRequest struct {
+	Target                              string `json:"-"`
+	TableName                           string
+	Key                                 map[string]json.RawMessage
+	ConditionExpression                 string
+	UpdateExpression                    string
+	ReturnValues                        string
+	ReturnValuesOnConditionCheckFailure string
+	ConsistentRead                      bool
+	ExpressionAttributeNames            map[string]string
+	ExpressionAttributeValues           map[string]json.RawMessage
 }
 
-// helper functions for reusing a fixed test table when the REUSE env is set
-func getTableName() string {
-	if os.Getenv("REUSE") != "" {
-		return "go-dynamolock"
-	}
-	return "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
-}
+const conditionalJSON = `{"__type":"ConditionalCheckFailedException","message":"condition failed"}`
+const serverErrorJSON = `{"__type":"InternalServerError","message":"response lost"}`
+const rejectedJSON = `{"__type":"ValidationException","message":"rejected before applying"}`
 
-func ClearTable(ctx context.Context, table string) error {
-	deleteBatch := func(reqs []types.WriteRequest) error {
-		const maxUnprocessedRetries = 20
-		for attempt := 0; len(reqs) != 0; attempt++ {
-			if attempt >= maxUnprocessedRetries {
-				return fmt.Errorf("failed to delete %d unprocessed items from %s after %d retries", len(reqs), table, maxUnprocessedRetries)
+func protocolClient(fn func(context.Context, wireRequest) (int, any, error)) *dynamodb.Client {
+	return dynamodb.New(dynamodb.Options{
+		Region: "us-east-1",
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		}),
+		// Deliberately enable SDK retries: the library must override them.
+		Retryer: retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 7
+			o.Backoff = retry.BackoffDelayerFunc(func(int, error) (time.Duration, error) { return 0, nil })
+		}),
+		HTTPClient: httpFunc(func(req *http.Request) (*http.Response, error) {
+			var w wireRequest
+			if err := json.NewDecoder(req.Body).Decode(&w); err != nil {
+				return nil, err
 			}
-			out, err := lib.DynamoDBClient().BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
-				RequestItems: map[string][]types.WriteRequest{
-					table: reqs,
-				},
-			})
+			w.Target = req.Header.Get("X-Amz-Target")
+			status, body, err := fn(req.Context(), w)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			reqs = out.UnprocessedItems[table]
-			if len(reqs) == 0 {
-				return nil
+			var encoded []byte
+			if text, ok := body.(string); ok {
+				encoded = []byte(text)
+			} else {
+				encoded, err = json.Marshal(body)
+				if err != nil {
+					return nil, err
+				}
 			}
-			delay := time.Duration(attempt+1) * 200 * time.Millisecond
-			if delay > 2*time.Second {
-				delay = 2 * time.Second
-			}
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			}
-		}
-		return nil
-	}
-
-	for {
-		out, err := lib.DynamoDBClient().Scan(ctx, &dynamodb.ScanInput{
-			TableName:            aws.String(table),
-			ProjectionExpression: aws.String("id"),
-			Limit:                aws.Int32(128),
-		})
-		if err != nil {
-			return err
-		}
-		if len(out.Items) == 0 {
-			return nil
-		}
-		var reqs []types.WriteRequest
-		for _, item := range out.Items {
-			reqs = append(reqs, types.WriteRequest{
-				DeleteRequest: &types.DeleteRequest{
-					Key: item,
+			return &http.Response{
+				StatusCode: status, Request: req,
+				Header: http.Header{
+					"Content-Type": {"application/x-amz-json-1.0"},
+					"X-Amz-Crc32":  {strconv.FormatUint(uint64(crc32.ChecksumIEEE(encoded)), 10)},
 				},
-			})
-			if len(reqs) == 25 {
-				if err := deleteBatch(reqs); err != nil {
-					return err
-				}
-				reqs = nil
-			}
-		}
-		if len(reqs) != 0 {
-			if err := deleteBatch(reqs); err != nil {
-				return err
-			}
-		}
-		if len(out.LastEvaluatedKey) == 0 {
-			return nil
-		}
+				Body: io.NopCloser(strings.NewReader(string(encoded))),
+			}, nil
+		}),
+	})
+}
+
+// These are scripted responses, not a DynamoDB condition evaluator or a second
+// implementation of the lock. Live tests validate the actual conditions.
+func acquiredItem(w wireRequest, data string) map[string]json.RawMessage {
+	item := map[string]json.RawMessage{
+		"id": w.Key["id"], "owner_token": w.ExpressionAttributeValues[":owner"],
+		"expires_at": w.ExpressionAttributeValues[":expires"],
 	}
-}
-
-func teardown(table string) {
-	ctx := context.Background()
-	if os.Getenv("REUSE") != "" {
-		_ = ClearTable(ctx, table)
-	} else {
-		_ = lib.DynamoDBDeleteTable(ctx, table, false, false)
+	if data != "" {
+		item["data"] = json.RawMessage(`{"M":` + data + `}`)
 	}
+	return item
 }
 
-func Uid() string {
-	return uuid.Must(uuid.NewV4()).String()
+func acquireReply(w wireRequest, data string) (int, any, error) {
+	return 200, map[string]any{"Attributes": acquiredItem(w, data)}, nil
 }
 
-func setup(t *testing.T, table string) error {
+func protocolInput() *LockInput {
+	return &LockInput{Table: "protocol-table", ID: "key", HeartbeatMaxAge: 2 * time.Hour, HeartbeatInterval: time.Hour}
+}
+
+func wireInt(w wireRequest, name string) int64 {
+	var av struct{ N string }
+	if json.Unmarshal(w.ExpressionAttributeValues[name], &av) != nil {
+		return 0
+	}
+	n, _ := strconv.ParseInt(av.N, 10, 64)
+	return n
+}
+
+func await(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
-	checkAccount(t)
-	input := &dynamodb.CreateTableInput{
-		TableName:   aws.String(table),
-		BillingMode: types.BillingModePayPerRequest,
-		StreamSpecification: &types.StreamSpecification{
-			StreamEnabled: aws.Bool(false),
-		},
-		AttributeDefinitions: []types.AttributeDefinition{
-			{
-				AttributeName: aws.String("id"),
-				AttributeType: types.ScalarAttributeTypeS,
-			},
-		},
-		KeySchema: []types.KeySchemaElement{
-			{
-				AttributeName: aws.String("id"),
-				KeyType:       types.KeyTypeHash,
-			},
-		},
-	}
-	err := lib.DynamoDBEnsure(context.Background(), input, nil, false)
-	if err != nil {
-		return err
-	}
-	if os.Getenv("REUSE") != "" {
-		err := lib.DynamoDBWaitForReady(context.Background(), table)
-		if err != nil {
-			return err
-		}
-		return ClearTable(context.Background(), table)
-	}
-	return nil
-}
-
-func TestBasic(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	unlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data != nil {
-		t.Fatalf("data should be nil")
-	}
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err == nil {
-		t.Fatal("acquired lock twice")
-	}
-	err = unlock(ctx, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestReadModifyWrite(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	max := 50
-	var sum int32
-	var inCriticalSection int32
-	done := make(chan error, max)
-	for range max {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					done <- ctx.Err()
-					return
-				default:
-				}
-				unlock, _, data, err := Lock[Data](ctx, &LockInput{
-					Table:             table,
-					ID:                id,
-					HeartbeatMaxAge:   time.Second * 5,
-					HeartbeatInterval: time.Second * 1,
-					Retries:           5,
-					RetriesSleep:      1 * time.Second,
-				})
-				if err != nil {
-					continue
-				}
-				if !atomic.CompareAndSwapInt32(&inCriticalSection, 0, 1) {
-					_ = unlock(ctx, data)
-					done <- fmt.Errorf("lock allowed concurrent critical sections")
-					return
-				}
-				time.Sleep(time.Duration(rand.Intn(500)) * time.Millisecond)
-				newSum := atomic.AddInt32(&sum, 1)
-				lib.Logger.Println("releasing lock, sum:", newSum)
-				atomic.StoreInt32(&inCriticalSection, 0)
-				err = unlock(ctx, data)
-				if err != nil {
-					done <- err
-					return
-				}
-				done <- nil
-				return
-			}
-		}()
-	}
-	for range max {
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-	}
-	if got := atomic.LoadInt32(&sum); got != int32(max) {
-		t.Errorf("expected %d, got %d", max, got)
-	}
-}
-
-type testData struct {
-	Value string
-}
-
-func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	id := Uid()
-	unlock, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   2 * time.Minute,
-		HeartbeatInterval: time.Minute,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = unlock(ctx, &Data{Value: "old"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	originalClient := dynamoDBClient
-	defer func() { dynamoDBClient = originalClient }()
-
-	seenAcquireAttempt := make(chan struct{}, 1)
-	releaseAcquire := make(chan struct{})
-	releaseDelayedAcquire := sync.OnceFunc(func() { close(releaseAcquire) })
-	t.Cleanup(releaseDelayedAcquire)
-	dynamoDBClient = func() *dynamodb.Client {
-		client := originalClient()
-		return dynamodb.New(client.Options(), func(options *dynamodb.Options) {
-			options.HTTPClient = lockAcquireDelayClient{
-				base:               options.HTTPClient,
-				seenAcquireAttempt: seenAcquireAttempt,
-				releaseAcquire:     releaseAcquire,
-			}
-		})
-	}
-
-	contenderCtx, cancelContender := context.WithCancel(ctx)
-	t.Cleanup(cancelContender)
-	lockResult := make(chan struct {
-		unlock UnlockFn[Data]
-		data   *Data
-		err    error
-	}, 1)
-	go func() {
-		delayedCtx := context.WithValue(contenderCtx, delayAcquireContextKey{}, true)
-		unlock, _, data, err := Lock[Data](delayedCtx, &LockInput{
-			Table:             table,
-			ID:                id,
-			HeartbeatMaxAge:   30 * time.Second,
-			HeartbeatInterval: 15 * time.Second,
-		})
-		lockResult <- struct {
-			unlock UnlockFn[Data]
-			data   *Data
-			err    error
-		}{unlock: unlock, data: data, err: err}
-	}()
-
 	select {
-	case <-seenAcquireAttempt:
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for contender's acquire attempt")
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for test synchronization")
 	}
+}
 
-	otherUnlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   2 * time.Minute,
-		HeartbeatInterval: time.Minute,
+func cleanupLease[T any](t *testing.T, l *Lease[T]) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := l.Release(ctx); err != nil {
+			t.Errorf("release test lease: %v", err)
+		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data == nil || data.Value != "old" {
-		t.Fatalf("expected other holder to read old data, got %#v", data)
-	}
-	err = otherUnlock(ctx, &Data{Value: "fresh"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	releaseDelayedAcquire()
+}
 
-	select {
-	case result := <-lockResult:
-		if result.err != nil {
-			t.Fatal(result.err)
-		}
-		if result.data == nil {
-			t.Fatal("data is nil")
-		}
-		if result.data.Value != "fresh" {
-			t.Fatalf("expected fresh data from successful acquisition, got %q", result.data.Value)
-		}
-		err = result.unlock(ctx, result.data)
+type keyedData struct {
+	ID    string `dynamodbav:"id"`
+	Value string `dynamodbav:"value"`
+}
+
+func TestEnvelopeIdentityAndReplacement(t *testing.T) {
+	for _, id := range []string{"", "key"} {
+		item, err := MarshalItem("key", &keyedData{ID: id, Value: "value"})
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for contender lock result")
-	}
-}
-
-type retryCheckClient struct {
-	attempts int32
-}
-
-type providedContextClient struct {
-	putItems int32
-}
-
-func (c *providedContextClient) Do(req *http.Request) (*http.Response, error) {
-	if err := req.Context().Err(); err != nil {
-		return nil, err
-	}
-	switch req.Header.Get("X-Amz-Target") {
-	case "DynamoDB_20120810.UpdateItem":
-	case "DynamoDB_20120810.PutItem":
-		atomic.AddInt32(&c.putItems, 1)
-	default:
-		return nil, fmt.Errorf("unexpected dynamodb operation: %s", req.Header.Get("X-Amz-Target"))
-	}
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Status:     "200 OK",
-		Header: http.Header{
-			"Content-Type":     []string{"application/x-amz-json-1.0"},
-			"X-Amzn-Requestid": []string{"test-request-id"},
-		},
-		Body:    io.NopCloser(strings.NewReader(`{}`)),
-		Request: req,
-	}, nil
-}
-
-func TestReturnedFunctionsUseProvidedContext(t *testing.T) {
-	originalClient := dynamoDBClient
-	t.Cleanup(func() { dynamoDBClient = originalClient })
-
-	testClient := &providedContextClient{}
-	dynamoDBClient = func() *dynamodb.Client {
-		return dynamodb.New(dynamodb.Options{
-			Region: "us-east-1",
-			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
-			}),
-			HTTPClient: testClient,
-		})
-	}
-
-	lockCtx, cancelLock := context.WithCancel(context.Background())
-	unlock, update, _, err := Lock[Data](lockCtx, &LockInput{
-		Table:             "provided-context",
-		ID:                "provided-context",
-		HeartbeatMaxAge:   2 * time.Hour,
-		HeartbeatInterval: time.Hour,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancelLock()
-
-	callCtx := context.Background()
-	err = update(callCtx, &Data{Value: "update"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = unlock(callCtx, &Data{Value: "unlock"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := atomic.LoadInt32(&testClient.putItems); got != 2 {
-		t.Fatalf("expected update and unlock PutItem calls, got %d", got)
-	}
-}
-
-type releaseHeartbeatClient struct {
-	updateItems                  int32
-	releaseStarted               chan struct{}
-	heartbeatDuringRelease       chan struct{}
-	signalReleaseStarted         func()
-	signalHeartbeatDuringRelease func()
-}
-
-func newReleaseHeartbeatClient() *releaseHeartbeatClient {
-	client := &releaseHeartbeatClient{
-		releaseStarted:         make(chan struct{}),
-		heartbeatDuringRelease: make(chan struct{}),
-	}
-	client.signalReleaseStarted = sync.OnceFunc(func() { close(client.releaseStarted) })
-	client.signalHeartbeatDuringRelease = sync.OnceFunc(func() { close(client.heartbeatDuringRelease) })
-	return client
-}
-
-func (c *releaseHeartbeatClient) Do(req *http.Request) (*http.Response, error) {
-	response := func() *http.Response {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Status:     "200 OK",
-			Header: http.Header{
-				"Content-Type":     []string{"application/x-amz-json-1.0"},
-				"X-Amzn-Requestid": []string{"test-request-id"},
-			},
-			Body:    io.NopCloser(strings.NewReader(`{}`)),
-			Request: req,
+		payload := item["data"].(*types.AttributeValueMemberM)
+		if _, duplicated := payload.Value["id"]; duplicated || len(item) != 2 {
+			t.Fatalf("identity duplicated in stored payload: %#v", item)
+		}
+		data, err := UnmarshalItem[keyedData](item)
+		if err != nil || data == nil || *data != (keyedData{ID: "key", Value: "value"}) {
+			t.Fatalf("identity round trip: %#v %v", data, err)
+		}
+		if _, mutated := payload.Value["id"]; mutated {
+			t.Fatal("decoding mutated the raw payload")
 		}
 	}
+	for _, data := range []any{nil, (*keyedData)(nil), 42, []int{1}, &keyedData{ID: "wrong"}, map[string]any{"id": 42}} {
+		if _, err := MarshalItem("key", data); !errors.Is(err, ErrInvalidPayload) {
+			t.Errorf("payload %T was not rejected: %v", data, err)
+		}
+	}
+	item, err := MarshalItem("key", map[string]any{"owner_token": "application", "expires_at": 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := UnmarshalItem[map[string]any](item)
+	if err != nil || (*data)["id"] != "key" || (*data)["owner_token"] != "application" {
+		t.Fatalf("nested metadata-name collision: %#v %v", data, err)
+	}
+}
 
-	switch req.Header.Get("X-Amz-Target") {
-	case "DynamoDB_20120810.UpdateItem":
-		if atomic.AddInt32(&c.updateItems, 1) > 1 {
-			select {
-			case <-c.releaseStarted:
-				c.signalHeartbeatDuringRelease()
-			default:
+func TestEnvelopeRejectsNilMaps(t *testing.T) {
+	type namedMap map[string]any
+	var data map[string]any
+	var named namedMap
+	var pointer *map[string]any
+	for _, payload := range []any{data, &data, named, &named, &pointer} {
+		if _, err := MarshalItem("key", payload); !errors.Is(err, ErrInvalidPayload) {
+			t.Errorf("nil payload %T was not rejected: %v", payload, err)
+		}
+	}
+}
+
+func TestProtocolNilMapWriteDoesNotClearPayload(t *testing.T) {
+	for _, commit := range []bool{false, true} {
+		t.Run(fmt.Sprint(commit), func(t *testing.T) {
+			var writes []wireRequest
+			client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+				if w.ReturnValues == "ALL_NEW" {
+					return acquireReply(w, `{"value":{"S":"retained"}}`)
+				}
+				if w.ExpressionAttributeValues[":data"] != nil {
+					writes = append(writes, w)
+				}
+				return 200, `{}`, nil
+			})
+			l, _, err := Lock[map[string]any](t.Context(), client, protocolInput())
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		return response(), nil
-	case "DynamoDB_20120810.PutItem":
-		c.signalReleaseStarted()
-		select {
-		case <-c.heartbeatDuringRelease:
-		case <-req.Context().Done():
-			return nil, req.Context().Err()
-		case <-time.After(time.Second):
-			return nil, fmt.Errorf("timed out waiting for heartbeat during release")
-		}
-		return response(), nil
-	default:
-		return nil, fmt.Errorf("unexpected dynamodb operation: %s", req.Header.Get("X-Amz-Target"))
-	}
-}
-
-func TestUnlockKeepsHeartbeatUntilReleaseSucceeds(t *testing.T) {
-	originalClient := dynamoDBClient
-	t.Cleanup(func() { dynamoDBClient = originalClient })
-
-	testClient := newReleaseHeartbeatClient()
-	dynamoDBClient = func() *dynamodb.Client {
-		return dynamodb.New(dynamodb.Options{
-			Region: "us-east-1",
-			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
-			}),
-			HTTPClient: testClient,
-		})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	unlock, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             "release-heartbeat",
-		ID:                "release-heartbeat",
-		HeartbeatMaxAge:   time.Second,
-		HeartbeatInterval: 10 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = unlock(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-type retryReleaseClient struct {
-	updateItems                 int32
-	putItems                    int32
-	releaseFailed               chan struct{}
-	heartbeatAfterReleaseFailed chan struct{}
-	signalReleaseFailed         func()
-	signalHeartbeatAfterFailure func()
-}
-
-func newRetryReleaseClient() *retryReleaseClient {
-	client := &retryReleaseClient{
-		releaseFailed:               make(chan struct{}),
-		heartbeatAfterReleaseFailed: make(chan struct{}),
-	}
-	client.signalReleaseFailed = sync.OnceFunc(func() { close(client.releaseFailed) })
-	client.signalHeartbeatAfterFailure = sync.OnceFunc(func() { close(client.heartbeatAfterReleaseFailed) })
-	return client
-}
-
-func (c *retryReleaseClient) Do(req *http.Request) (*http.Response, error) {
-	response := func() *http.Response {
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Status:     "200 OK",
-			Header: http.Header{
-				"Content-Type":     []string{"application/x-amz-json-1.0"},
-				"X-Amzn-Requestid": []string{"test-request-id"},
-			},
-			Body:    io.NopCloser(strings.NewReader(`{}`)),
-			Request: req,
-		}
-	}
-
-	switch req.Header.Get("X-Amz-Target") {
-	case "DynamoDB_20120810.UpdateItem":
-		if atomic.AddInt32(&c.updateItems, 1) > 1 {
-			select {
-			case <-c.releaseFailed:
-				c.signalHeartbeatAfterFailure()
-			default:
+			cleanupLease(t, l)
+			write := l.Update
+			if commit {
+				write = l.Commit
 			}
-		}
-		return response(), nil
-	case "DynamoDB_20120810.PutItem":
-		if atomic.AddInt32(&c.putItems, 1) == 1 {
-			c.signalReleaseFailed()
-			return nil, fmt.Errorf("temporary release failure")
-		}
-		return response(), nil
-	default:
-		return nil, fmt.Errorf("unexpected dynamodb operation: %s", req.Header.Get("X-Amz-Target"))
+			var data map[string]any
+			if err := write(t.Context(), &data); !errors.Is(err, ErrInvalidPayload) || len(writes) != 0 {
+				t.Fatalf("nil map could clear the payload: err=%v writes=%d", err, len(writes))
+			}
+			if l.Context().Err() != nil {
+				t.Fatalf("invalid payload lost the lease: %v", context.Cause(l.Context()))
+			}
+			data = make(map[string]any)
+			if err := write(t.Context(), &data); err != nil {
+				t.Fatal(err)
+			}
+			if len(writes) != 1 || string(writes[0].ExpressionAttributeValues[":data"]) != `{"M":{}}` {
+				t.Fatalf("explicit empty map was not written: %#v", writes)
+			}
+		})
 	}
 }
 
-func TestUnlockFailureKeepsHeartbeatAndAllowsRetry(t *testing.T) {
-	originalClient := dynamoDBClient
-	t.Cleanup(func() { dynamoDBClient = originalClient })
-
-	testClient := newRetryReleaseClient()
-	dynamoDBClient = func() *dynamodb.Client {
-		return dynamodb.New(dynamodb.Options{
-			Region: "us-east-1",
-			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
-			}),
-			HTTPClient: testClient,
-			Retryer:    aws.NopRetryer{},
-		})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	unlock, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             "release-retry",
-		ID:                "release-retry",
-		HeartbeatMaxAge:   time.Second,
-		HeartbeatInterval: 10 * time.Millisecond,
-	})
+func TestEnvelopePreservesInterfaceNumbers(t *testing.T) {
+	const integer = "9007199254740993"
+	const decimal = "0.123456789012345678901234567890"
+	item := key("key")
+	item["data"] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
+		"integer": &types.AttributeValueMemberN{Value: integer},
+		"nested": &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
+			"decimal": &types.AttributeValueMemberN{Value: decimal},
+		}},
+	}}
+	data, err := UnmarshalItem[map[string]any](item)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = unlock(ctx, nil)
-	if err == nil {
-		t.Fatal("expected first unlock to fail")
+	if got := (*data)["integer"]; got != attributevalue.Number(integer) {
+		t.Errorf("interface number lost precision or type: %T %v", got, got)
 	}
-	select {
-	case <-testClient.heartbeatAfterReleaseFailed:
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for heartbeat after failed unlock")
+	encoded, err := MarshalItem("key", data)
+	if err != nil || !reflect.DeepEqual(encoded, item) {
+		t.Errorf("unchanged map round-trip changed numbers: %#v %v", encoded, err)
 	}
-	err = unlock(ctx, nil)
+
+	// Typed numbers keep their declared Go type; interface fields inside structs
+	// receive the same precise number representation as dynamic maps.
+	type typedData struct {
+		Integer int64 `dynamodbav:"integer"`
+		Nested  any   `dynamodbav:"nested"`
+	}
+	typed, err := UnmarshalItem[typedData](item)
+	if err != nil || typed == nil || typed.Integer != 9007199254740993 {
+		t.Fatalf("typed integer changed: %#v %v", typed, err)
+	}
+	encoded, err = MarshalItem("key", typed)
+	if err != nil || !reflect.DeepEqual(encoded, item) {
+		t.Errorf("struct interface field changed numbers: %#v %v", encoded, err)
+	}
+}
+
+func TestEnvelopeAbsentVersusEmpty(t *testing.T) {
+	for _, item := range []map[string]types.AttributeValue{nil, key("key")} {
+		value, err := UnmarshalItem[keyedData](item)
+		if err != nil || value != nil {
+			t.Fatalf("absent payload: %#v %v", value, err)
+		}
+	}
+	item, err := MarshalItem("key", struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := atomic.LoadInt32(&testClient.putItems); got != 2 {
-		t.Fatalf("expected two release attempts, got %d", got)
+	value, err := UnmarshalItem[keyedData](item)
+	if err != nil || value == nil || value.ID != "key" {
+		t.Fatalf("explicitly empty payload: %#v %v", value, err)
 	}
-}
-
-type requireExistingClient struct {
-	condition       string
-	names           map[string]string
-	returnOnFailure string
-	attempts        int32
-}
-
-func (c *requireExistingClient) Do(req *http.Request) (*http.Response, error) {
-	atomic.AddInt32(&c.attempts, 1)
-	var body struct {
-		ConditionExpression                 string            `json:"ConditionExpression"`
-		ExpressionAttributeNames            map[string]string `json:"ExpressionAttributeNames"`
-		ReturnValuesOnConditionCheckFailure string            `json:"ReturnValuesOnConditionCheckFailure"`
-	}
-	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-		return nil, err
-	}
-	c.condition = body.ConditionExpression
-	c.names = body.ExpressionAttributeNames
-	c.returnOnFailure = body.ReturnValuesOnConditionCheckFailure
-	responseBody := `{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"conditional failed"}`
-	return &http.Response{
-		StatusCode: http.StatusBadRequest,
-		Status:     "400 Bad Request",
-		Header: http.Header{
-			"Content-Type":     []string{"application/x-amz-json-1.0"},
-			"X-Amzn-Requestid": []string{"test-request-id"},
-		},
-		Body:    io.NopCloser(strings.NewReader(responseBody)),
-		Request: req,
-	}, nil
-}
-
-func TestLockRequireExistingMakesCreationConditionallyImpossible(t *testing.T) {
-	originalClient := dynamoDBClient
-	t.Cleanup(func() { dynamoDBClient = originalClient })
-	testClient := &requireExistingClient{}
-	dynamoDBClient = func() *dynamodb.Client {
-		return dynamodb.New(dynamodb.Options{
-			Region: "us-east-1",
-			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
-			}),
-			HTTPClient: testClient,
-		})
-	}
-
-	_, _, _, err := Lock[Data](context.Background(), &LockInput{
-		Table:             "require-existing",
-		ID:                "missing-record",
-		RequireExisting:   true,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
-		Retries:           2,
-		RetriesSleep:      time.Nanosecond,
-	})
-	if !errors.Is(err, ErrLockNotFound) {
-		t.Fatalf("expected ErrLockNotFound, got: %v", err)
-	}
-	if !errors.Is(err, ErrLockUnavailable) {
-		t.Fatalf("expected ErrLockNotFound to also match ErrLockUnavailable, got: %v", err)
-	}
-	if got := atomic.LoadInt32(&testClient.attempts); got != 1 {
-		t.Fatalf("expected a missing required record to stop without retry, got %d attempts", got)
-	}
-	if testClient.returnOnFailure != string(types.ReturnValuesOnConditionCheckFailureAllOld) {
-		t.Fatalf("expected failed acquisition to return the existing item, got %q", testClient.returnOnFailure)
-	}
-	if !strings.Contains(testClient.condition, "attribute_exists") {
-		t.Fatalf("acquisition condition can create a missing record: %q", testClient.condition)
-	}
-	idReferenced := false
-	for placeholder, name := range testClient.names {
-		if name == "id" && strings.Contains(testClient.condition, placeholder) {
-			idReferenced = true
+	for _, field := range []string{"uid", "unix", "legacy-data"} {
+		bad := key("key")
+		bad[field] = &types.AttributeValueMemberS{Value: "legacy"}
+		if _, err := UnmarshalItem[keyedData](bad); !errors.Is(err, ErrInvalidRecord) {
+			t.Errorf("legacy %q accepted: %v", field, err)
 		}
 	}
-	if !idReferenced {
-		t.Fatalf("required-existence condition does not reference the primary ID: condition=%q names=%v", testClient.condition, testClient.names)
+	item["data"].(*types.AttributeValueMemberM).Value = key("key")
+	if _, err := UnmarshalItem[keyedData](item); !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("duplicate data.id accepted: %v", err)
+	}
+}
+
+func TestProtocolAtomicAcquireAndCopiedInput(t *testing.T) {
+	var calls []wireRequest
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		calls = append(calls, w)
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, `{"value":{"S":"fresh"}}`)
+		}
+		return 200, `{}`, nil
+	})
+	in := protocolInput()
+	l, data, err := Lock[keyedData](t.Context(), client, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
+	if data == nil || data.ID != "key" || data.Value != "fresh" || len(calls) != 1 {
+		t.Fatalf("payload not returned by atomic acquire: %#v, requests=%d", data, len(calls))
+	}
+	in.Table, in.ID, in.HeartbeatInterval = "wrong-table", "wrong-key", time.Nanosecond
+	if err := l.Commit(t.Context(), data); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range calls {
+		if w.TableName != "protocol-table" || string(w.Key["id"]) != `{"S":"key"}` || w.Target != "DynamoDB_20120810.UpdateItem" {
+			t.Fatalf("handle retargeted or whole item replaced: %#v", w)
+		}
+	}
+	if !errors.Is(l.Update(t.Context(), data), ErrReleased) || !errors.Is(l.Commit(t.Context(), data), ErrReleased) {
+		t.Fatal("completed handle permitted another payload write")
 	}
 }
 
 func TestLockExpirationDoesNotIncludeRoundedBoundary(t *testing.T) {
-	originalClient := dynamoDBClient
-	t.Cleanup(func() { dynamoDBClient = originalClient })
-	checkClient := &requireExistingClient{}
-	dynamoDBClient = newRetryCheckDynamoDBClient(checkClient)
-
-	_, _, _, err := Lock[Data](t.Context(), &LockInput{
-		Table:             "expiration-boundary",
-		ID:                "expiration-boundary",
-		HeartbeatMaxAge:   100 * time.Millisecond,
-		HeartbeatInterval: 40 * time.Millisecond,
+	var w wireRequest
+	client := protocolClient(func(_ context.Context, req wireRequest) (int, any, error) {
+		w = req
+		return 400, conditionalJSON, nil
 	})
+	in := protocolInput()
+	in.HeartbeatMaxAge, in.HeartbeatInterval = 100*time.Millisecond, 40*time.Millisecond
+	before := time.Now()
+	_, _, err := Lock[keyedData](t.Context(), client, in)
+	after := time.Now()
 	if !errors.Is(err, ErrLockHeld) {
-		t.Fatalf("expected scripted contention, got: %v", err)
+		t.Fatal(err)
 	}
-
-	// A heartbeat late in a second can equal floor(now - max age) while
-	// still fresh. Assert the actual request excludes that rounded boundary.
-	for placeholder, name := range checkClient.names {
-		if name == "unix" && strings.Contains(checkClient.condition, placeholder+" < ") {
-			return
-		}
+	if !strings.Contains(w.ConditionExpression, "#expires < :now") || w.ExpressionAttributeNames["#expires"] != "expires_at" {
+		t.Fatalf("not comparing the holder's expiry: %s", w.ConditionExpression)
 	}
-	t.Fatalf("expiration must use a strict timestamp comparison, got: %q", checkClient.condition)
+	cutoff, expiry := wireInt(w, ":now"), wireInt(w, ":expires")
+	if cutoff < before.UnixNano() || cutoff > after.UnixNano() || expiry-cutoff != int64(in.HeartbeatMaxAge) {
+		t.Fatalf("truncated or contender-adjusted timestamps: cutoff=%d expiry=%d", cutoff, expiry)
+	}
 }
 
-func newRetryCheckDynamoDBClient(c dynamodb.HTTPClient) func() *dynamodb.Client {
-	return func() *dynamodb.Client {
-		return dynamodb.New(dynamodb.Options{
-			Region: "us-east-1",
-			Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test", Source: "test"}, nil
-			}),
-			HTTPClient: c,
+func TestProtocolAcquireAmbiguousOutcome(t *testing.T) {
+	for _, own := range []bool{false, true} {
+		t.Run(strconv.FormatBool(own), func(t *testing.T) {
+			var saved map[string]json.RawMessage
+			var acquires, reads int
+			client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+				if w.ReturnValues == "ALL_NEW" {
+					acquires++
+					saved = acquiredItem(w, `{"value":{"S":"retained"}}`)
+					return 500, serverErrorJSON, nil
+				}
+				if w.Target == "DynamoDB_20120810.GetItem" {
+					reads++
+					if !w.ConsistentRead {
+						return 0, nil, errors.New("reconciliation was not strongly consistent")
+					}
+					if own {
+						return 200, map[string]any{"Item": saved}, nil
+					}
+					return 200, `{}`, nil
+				}
+				return 200, `{}`, nil
+			})
+			l, data, err := Lock[keyedData](t.Context(), client, protocolInput())
+			if own {
+				if err != nil || data == nil || data.Value != "retained" {
+					t.Fatalf("own committed acquisition not recognized: %#v %v", data, err)
+				}
+				cleanupLease(t, l)
+			} else if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, ErrLockUnavailable) || l != nil {
+				t.Fatalf("unconfirmed acquisition misclassified: %v", err)
+			}
+			if acquires != 1 || reads != 1 {
+				t.Fatalf("SDK/library stacked retries: acquires=%d reads=%d", acquires, reads)
+			}
 		})
 	}
 }
 
-func (c *retryCheckClient) Do(req *http.Request) (*http.Response, error) {
-	atomic.AddInt32(&c.attempts, 1)
-	body := `{"__type":"com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException","message":"conditional failed"}`
-	return &http.Response{
-		StatusCode: http.StatusBadRequest,
-		Status:     "400 Bad Request",
-		Header: http.Header{
-			"Content-Type":     []string{"application/x-amz-json-1.0"},
-			"X-Amzn-Requestid": []string{"test-request-id"},
-		},
-		Body:    io.NopCloser(strings.NewReader(body)),
-		Request: req,
-	}, nil
-}
-
-func assertRetryAttempts(t *testing.T, retries int, retriesSleep time.Duration) time.Duration {
-	t.Helper()
-	originalClient := dynamoDBClient
-	t.Cleanup(func() { dynamoDBClient = originalClient })
-	checkClient := &retryCheckClient{}
-	dynamoDBClient = newRetryCheckDynamoDBClient(checkClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	_, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             "retry-check",
-		ID:                "retry-check",
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           retries,
-		RetriesSleep:      retriesSleep,
-	})
-	duration := time.Since(start)
-	if err == nil {
-		t.Fatal("expected lock acquisition to fail")
-	}
-	if !errors.Is(err, ErrLockHeld) {
-		t.Fatalf("expected ErrLockHeld, got: %v", err)
-	}
-	if !errors.Is(err, ErrLockUnavailable) {
-		t.Fatalf("expected ErrLockHeld to also match ErrLockUnavailable, got: %v", err)
-	}
-	if errors.Is(err, ErrLockNotFound) {
-		t.Fatalf("lock contention incorrectly matched ErrLockNotFound: %v", err)
-	}
-	if !strings.Contains(err.Error(), "lock is held") {
-		t.Fatalf("expected lock contention context, got: %v", err)
-	}
-	want := int32(retries + 1)
-	if got := atomic.LoadInt32(&checkClient.attempts); got != want {
-		t.Fatalf("expected %d acquire attempts, got %d", want, got)
-	}
-	return duration
-}
-
-type delayAcquireContextKey struct{}
-
-type lockAcquireDelayClient struct {
-	base               dynamodb.HTTPClient
-	seenAcquireAttempt chan<- struct{}
-	releaseAcquire     <-chan struct{}
-}
-
-func (c lockAcquireDelayClient) Do(req *http.Request) (*http.Response, error) {
-	if req.Context().Value(delayAcquireContextKey{}) != true {
-		return c.base.Do(req)
-	}
-	if req.Header.Get("X-Amz-Target") == "DynamoDB_20120810.UpdateItem" {
-		select {
-		case c.seenAcquireAttempt <- struct{}{}:
-		default:
+func TestProtocolDecodeFailureReleasesRawPayload(t *testing.T) {
+	var calls []wireRequest
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		calls = append(calls, w)
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, `{"value":{"M":{"unknown":{"N":"12345678901234567890"}}}}`)
 		}
-		select {
-		case <-c.releaseAcquire:
-		case <-req.Context().Done():
-			return nil, req.Context().Err()
+		return 200, `{}`, nil
+	})
+	l, _, err := Lock[keyedData](t.Context(), client, protocolInput())
+	if err == nil || l != nil || len(calls) != 2 {
+		t.Fatalf("decode failure abandoned ownership: lease=%v err=%v requests=%d", l, err, len(calls))
+	}
+	if calls[1].UpdateExpression != "REMOVE #owner, #expires" || calls[1].ExpressionAttributeValues[":data"] != nil {
+		t.Fatalf("cleanup changed malformed payload: %#v", calls[1])
+	}
+}
+
+type blockingPayload struct {
+	ready, resume chan struct{}
+}
+
+func (p blockingPayload) MarshalDynamoDBAttributeValue() (types.AttributeValue, error) {
+	close(p.ready)
+	<-p.resume
+	return &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{"value": &types.AttributeValueMemberS{Value: "new"}}}, nil
+}
+
+func TestProtocolSlowPayloadCannotOverwriteHeartbeat(t *testing.T) {
+	var renewals atomic.Int32
+	renewed := make(chan struct{}, 1)
+	var payload wireRequest
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
 		}
-	}
-	return c.base.Do(req)
-}
-
-func TestData(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid() // new id means empty data
-	unlock, _, data, err := Lock[testData](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data != nil {
-		t.Fatal("data not nil")
-	}
-	err = unlock(ctx, &testData{Value: "asdf"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	unlock, _, data, err = Lock[testData](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data == nil {
-		t.Fatal("data is nil")
-	} else if data.Value != "asdf" {
-		t.Fatal("data mismatch")
-	}
-	read, err := Read[testData](ctx, table, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read == nil {
-		t.Fatal("read is nil")
-	} else if read.Value != "asdf" {
-		t.Fatal("read mismatch")
-	}
-	err = unlock(ctx, &testData{Value: "123"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	unlock, _, data, err = Lock[testData](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data == nil {
-		t.Fatal("data is nil")
-	} else if data.Value != "123" {
-		t.Fatal("data mismatch")
-	}
-	err = unlock(ctx, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLockRequireExisting(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	if err := setup(t, table); err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	if err := lib.DynamoDBWaitForReady(ctx, table); err != nil {
-		t.Fatal(err)
-	}
-
-	id := "require-existing"
-	_, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		RequireExisting:   true,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
-		Retries:           2,
-		RetriesSleep:      time.Nanosecond,
-	})
-	if !errors.Is(err, ErrLockNotFound) {
-		t.Fatalf("expected ErrLockNotFound, got: %v", err)
-	}
-	if !errors.Is(err, ErrLockUnavailable) {
-		t.Fatalf("expected missing item to also match ErrLockUnavailable, got: %v", err)
-	}
-	if errors.Is(err, ErrLockHeld) {
-		t.Fatalf("missing item incorrectly matched ErrLockHeld: %v", err)
-	}
-	data, err := Read[Data](ctx, table, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data != nil {
-		t.Fatalf("required acquisition created missing item: %#v", data)
-	}
-
-	unlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data != nil {
-		t.Fatalf("default acquisition returned data for a missing item: %#v", data)
-	}
-	if err := unlock(ctx, &Data{Value: "existing"}); err != nil {
-		t.Fatal(err)
-	}
-
-	unlock, _, data, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		RequireExisting:   true,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data == nil || data.Value != "existing" {
-		t.Fatalf("required acquisition returned wrong existing data: %#v", data)
-	}
-
-	_, _, _, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		RequireExisting:   true,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
-	})
-	if !errors.Is(err, ErrLockHeld) {
-		t.Fatalf("expected held item to match ErrLockHeld, got: %v", err)
-	}
-	if !errors.Is(err, ErrLockUnavailable) {
-		t.Fatalf("expected held item to also match ErrLockUnavailable, got: %v", err)
-	}
-	if errors.Is(err, ErrLockNotFound) {
-		t.Fatalf("held item incorrectly matched ErrLockNotFound: %v", err)
-	}
-	if err := unlock(ctx, data); err != nil {
-		t.Fatal(err)
-	}
-}
-
-type preExistingData struct {
-	ID    string `json:"id" dynamodbav:"id"`
-	Value string `json:"value" dynamodbav:"value"`
-	// note you cannot use "uid" or "unix", since those are part of LockData{}
-}
-
-func TestPreExistingData(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	item, err := attributevalue.MarshalMap(preExistingData{
-		ID:    "test-id",
-		Value: "test-value",
-	})
-	if err != nil {
-		panic(err)
-	}
-	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(table),
-		Item:      item,
-	})
-	if err != nil {
-		panic(err)
-	}
-	id := "test-id"
-	unlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data == nil {
-		t.Fatal("data is nil")
-	} else if data.Value != "test-value" {
-		t.Fatal("wrong value")
-	}
-	_, _, data, err = Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err == nil {
-		t.Fatal("acquired lock twice")
-	}
-	err = unlock(ctx, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestWriteWithoutUnlocking(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := "test-id"
-	unlock, update, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data != nil {
-		t.Fatalf("data not nil")
-	}
-	data = &Data{Value: "asdf"}
-	time.Sleep(2 * time.Second)
-	err = update(ctx, data)
-	if err != nil {
-		panic(err)
-	}
-	read, err := Read[Data](ctx, table, id)
-	if err != nil {
-		panic(err)
-	}
-	if read == nil {
-		t.Fatal("read is nil")
-	} else if read.Value != "asdf" {
-		t.Fatal("wrong value")
-	}
-	data.Value = "foo"
-	time.Sleep(2 * time.Second)
-	err = update(ctx, data)
-	if err != nil {
-		panic(err)
-	}
-	read, err = Read[Data](ctx, table, id)
-	if err != nil {
-		panic(err)
-	}
-	if read == nil {
-		t.Fatal("read is nil")
-	} else if read.Value != "foo" {
-		t.Fatal("wrong value")
-	}
-	data.Value = "bar"
-	time.Sleep(2 * time.Second)
-	err = update(ctx, data)
-	if err != nil {
-		panic(err)
-	}
-	err = unlock(ctx, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	read, err = Read[Data](ctx, table, id)
-	if err != nil {
-		panic(err)
-	}
-	if read == nil {
-		t.Fatal("read is nil")
-	} else if read.Value != "bar" {
-		t.Fatal("wrong value")
-	}
-	read, err = Read[Data](ctx, table, "404")
-	if err != nil {
-		panic(err)
-	}
-	if read != nil {
-		t.Fatal("data should be empty")
-	}
-}
-
-func TestNullValueDoesNotBreakLocking(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	item := map[string]types.AttributeValue{
-		"id":  &types.AttributeValueMemberS{Value: "test-uid-null"},
-		"uid": &types.AttributeValueMemberNULL{Value: true},
-	}
-	_, err = lib.DynamoDBClient().PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(table),
-		Item:      item,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	unlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                "test-uid-null",
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data == nil {
-		t.Fatalf("data is nil")
-	}
-	err = unlock(ctx, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestHeartbeatErrorHandling(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	var heartbeatErrors int32
-	sabotageCtx, cancelSabotage := context.WithCancel(ctx)
-	defer cancelSabotage()
-	go func() {
-		timer := time.NewTimer(2 * time.Second)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-sabotageCtx.Done():
-			return
-		}
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			val := LockRecord{
-				LockKey: LockKey{
-					ID: id,
-				},
-				LockData: LockData{
-					Unix: time.Now().Unix(),
-					Uid:  "fake-uid",
-				},
-			}
-			item, err := attributevalue.MarshalMap(val)
-			if err != nil {
-				panic(err)
-			}
-			_, err = lib.DynamoDBClient().PutItem(sabotageCtx, &dynamodb.PutItemInput{
-				TableName: aws.String(table),
-				Item:      item,
-			})
-			if err != nil {
-				if sabotageCtx.Err() != nil || strings.Contains(err.Error(), "ResourceNotFoundException") {
-					return
-				}
-				panic(err)
-			}
+		if w.ExpressionAttributeValues[":next"] != nil {
+			renewals.Add(1)
 			select {
-			case <-ticker.C:
-			case <-sabotageCtx.Done():
-				return
+			case renewed <- struct{}{}:
+			default:
 			}
 		}
-	}()
-	unlock, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   5 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		HeartbeatErrFn: func(err error) {
-			atomic.AddInt32(&heartbeatErrors, 1)
-		},
+		if w.ExpressionAttributeValues[":data"] != nil {
+			payload = w
+		}
+		return 200, `{}`, nil
 	})
+	in := protocolInput()
+	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 10*time.Millisecond
+	l, _, err := Lock[blockingPayload](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(10 * time.Second)
-	if atomic.LoadInt32(&heartbeatErrors) != 1 {
-		t.Fatalf("expected onHeartbeatErr once, got %d times", heartbeatErrors)
+	cleanupLease(t, l)
+	p := &blockingPayload{ready: make(chan struct{}), resume: make(chan struct{})}
+	resume := sync.OnceFunc(func() { close(p.resume) })
+	t.Cleanup(resume)
+	done := make(chan error, 1)
+	go func() { done <- l.Update(t.Context(), p) }()
+	await(t, p.ready)
+	await(t, renewed)
+	resume()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
-	err = unlock(ctx, &Data{Value: "asdf"})
-	if err == nil {
-		t.Fatalf("should fail, uid changed by sabotage")
+	if renewals.Load() == 0 || payload.UpdateExpression != "SET #data = :data" || payload.ExpressionAttributeValues[":next"] != nil || payload.ExpressionAttributeValues[":expires"] != nil {
+		t.Fatalf("payload write could roll back renewal metadata: %#v", payload)
 	}
 }
 
-func TestUnlockTwiceFails(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	unlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
+func TestProtocolHeartbeatRetriesUseFreshTimestamps(t *testing.T) {
+	var timestamps []int64
+	var deadlines []time.Time
+	renewed := make(chan struct{})
+	client := protocolClient(func(ctx context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		if w.ExpressionAttributeValues[":next"] == nil {
+			return 200, `{}`, nil
+		}
+		timestamps = append(timestamps, wireInt(w, ":next"))
+		deadline, ok := ctx.Deadline()
+		if !ok || !strings.Contains(w.ConditionExpression, "#expires < :next") {
+			return 0, nil, errors.New("renewal lacks deadline or monotonic condition")
+		}
+		deadlines = append(deadlines, deadline)
+		if len(timestamps) == 1 {
+			return 500, serverErrorJSON, nil
+		}
+		if len(timestamps) == 2 {
+			close(renewed)
+		}
+		return 200, `{}`, nil
 	})
+	in := protocolInput()
+	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 100*time.Millisecond
+	l, _, err := Lock[keyedData](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data != nil {
-		t.Fatalf("data should be nil for new item")
-	}
-	err = unlock(ctx, &Data{Value: "temp"})
-	if err != nil {
+	cleanupLease(t, l)
+	await(t, renewed)
+	if err := l.Release(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	err = unlock(ctx, &Data{Value: "temp"})
-	if err == nil {
-		t.Fatalf("unlock twice should error")
+	if len(timestamps) != 2 || timestamps[1] <= timestamps[0] || !deadlines[0].Equal(deadlines[1]) {
+		t.Fatalf("stale timestamps or unconfirmed lease extension: %v %v", timestamps, deadlines)
 	}
 }
 
-func TestContextCancelBeforeLock(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestProtocolLeaseDeadlineCancelsBlockedRenewal(t *testing.T) {
+	entered, resume := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(resume) })
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		if w.ExpressionAttributeValues[":next"] != nil {
+			close(entered)
+			<-resume // Deliberately delay even after the request deadline.
+		}
+		return 200, `{}`, nil
+	})
+	in := protocolInput()
+	in.HeartbeatMaxAge, in.HeartbeatInterval = 80*time.Millisecond, 10*time.Millisecond
+	l, _, err := Lock[keyedData](t.Context(), client, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
+	t.Cleanup(unblock)
+	await(t, entered)
+	await(t, l.Context().Done())
+	if !errors.Is(context.Cause(l.Context()), ErrLeaseLost) {
+		t.Fatal(context.Cause(l.Context()))
+	}
+	if !errors.Is(l.Update(t.Context(), &keyedData{}), ErrLeaseLost) {
+		t.Fatal("lost lease allowed update")
+	}
+	unblock()
+	await(t, l.done)
+	if !errors.Is(l.Commit(t.Context(), &keyedData{}), ErrLeaseLost) {
+		t.Fatal("late renewal revived handle")
+	}
+}
+
+func TestProtocolDefinitiveLossIsNotRetried(t *testing.T) {
+	var renewals atomic.Int32
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		if w.ExpressionAttributeValues[":next"] != nil {
+			renewals.Add(1)
+		}
+		return 400, conditionalJSON, nil
+	})
+	in := protocolInput()
+	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, time.Millisecond
+	l, _, err := Lock[keyedData](t.Context(), client, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
+	await(t, l.Context().Done())
+	await(t, l.done)
+	if renewals.Load() != 1 || !errors.Is(context.Cause(l.Context()), ErrLeaseLost) {
+		t.Fatalf("definitive failure retried: %d %v", renewals.Load(), context.Cause(l.Context()))
+	}
+}
+
+func TestProtocolHeartbeatDuringCommitDoesNotCancelItsResponse(t *testing.T) {
+	started, heartbeat := make(chan struct{}), make(chan struct{})
+	var heartbeats atomic.Int32
+	client := protocolClient(func(ctx context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		if w.ExpressionAttributeValues[":data"] != nil {
+			close(started)
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-heartbeat:
+			}
+			if ctx.Err() != nil {
+				return 0, nil, errors.New("own release canceled commit response")
+			}
+			return 200, `{}`, nil
+		}
+		if w.ExpressionAttributeValues[":next"] != nil {
+			select {
+			case <-started:
+			default:
+				return 200, `{}`, nil
+			}
+			if heartbeats.Add(1) == 1 {
+				close(heartbeat)
+			}
+			return 400, conditionalJSON, nil
+		}
+		return 200, `{}`, nil
+	})
+	in := protocolInput()
+	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 10*time.Millisecond
+	l, _, err := Lock[keyedData](t.Context(), client, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
+	if err := l.Commit(l.Context(), &keyedData{Value: "committed"}); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(context.Cause(l.Context()), ErrReleased) {
+		t.Fatal(context.Cause(l.Context()))
+	}
+}
+
+func TestProtocolPayloadAmbiguityPermanentlyStopsWrites(t *testing.T) {
+	for _, commit := range []bool{false, true} {
+		t.Run(strconv.FormatBool(commit), func(t *testing.T) {
+			var writes atomic.Int32
+			client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+				if w.ReturnValues == "ALL_NEW" {
+					return acquireReply(w, "")
+				}
+				if w.ExpressionAttributeValues[":data"] != nil {
+					writes.Add(1)
+					return 500, serverErrorJSON, nil
+				}
+				return 400, conditionalJSON, nil
+			})
+			l, _, err := Lock[keyedData](t.Context(), client, protocolInput())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleanupLease(t, l)
+			if commit {
+				err = l.Commit(t.Context(), &keyedData{})
+			} else {
+				err = l.Update(t.Context(), &keyedData{})
+			}
+			if !errors.Is(err, ErrOutcomeUnknown) || !errors.Is(context.Cause(l.Context()), ErrOutcomeUnknown) {
+				t.Fatalf("ambiguous payload not terminal: %v %v", err, context.Cause(l.Context()))
+			}
+			if !errors.Is(l.Update(t.Context(), &keyedData{}), ErrLeaseLost) || !errors.Is(l.Commit(t.Context(), &keyedData{}), ErrLeaseLost) || writes.Load() != 1 {
+				t.Fatalf("ambiguous write retried or handle reused: %d", writes.Load())
+			}
+		})
+	}
+}
+
+func TestProtocolReleaseReconcilesAmbiguousSuccess(t *testing.T) {
+	var releases atomic.Int32
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, `{"unknown":{"N":"12345678901234567890"}}`)
+		}
+		if w.UpdateExpression != "REMOVE #owner, #expires" || w.ExpressionAttributeValues[":data"] != nil {
+			return 0, nil, errors.New("release modified payload")
+		}
+		if releases.Add(1) == 1 {
+			return 500, serverErrorJSON, nil
+		}
+		return 400, conditionalJSON, nil
+	})
+	l, _, err := Lock[keyedData](t.Context(), client, protocolInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
+	if err := l.Release(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if releases.Load() != 2 {
+		t.Fatalf("unexpected release attempts: %d", releases.Load())
+	}
+	await(t, l.done)
+	if err := l.Release(t.Context()); err != nil || releases.Load() != 2 {
+		t.Fatal("release was not idempotent")
+	}
+}
+
+func TestProtocolCanceledLeaseAllowsOnlyRelease(t *testing.T) {
+	var writes int
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		writes++
+		if w.UpdateExpression != "REMOVE #owner, #expires" {
+			return 0, nil, errors.New("canceled lease attempted payload write")
+		}
+		return 200, `{}`, nil
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	l, _, err := Lock[keyedData](ctx, client, protocolInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
 	cancel()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(l.Update(t.Context(), &keyedData{}), ErrLeaseLost) || !errors.Is(l.Commit(t.Context(), &keyedData{}), ErrLeaseLost) {
+		t.Fatal("canceled lease permitted data writes")
 	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(context.Background(), table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	unlock, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   2 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err == nil {
-		_ = unlock(context.Background(), nil)
-		t.Fatal("expected error when context is already canceled")
+	if err := l.Release(t.Context()); err != nil || writes != 1 {
+		t.Fatalf("fresh cleanup failed: %d %v", writes, err)
 	}
 }
 
-func TestUnlockUsesProvidedContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(context.Background(), table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	unlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   5 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
+func TestProtocolRejectedPayloadKeepsLease(t *testing.T) {
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		if w.ExpressionAttributeValues[":data"] != nil {
+			return 400, rejectedJSON, nil
+		}
+		return 200, `{}`, nil
 	})
+	l, _, err := Lock[keyedData](t.Context(), client, protocolInput())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if data != nil {
-		t.Fatal("data should be nil for a fresh lock")
+	cleanupLease(t, l)
+	for _, op := range []func(context.Context, *keyedData) error{l.Update, l.Commit} {
+		if !errors.Is(op(t.Context(), nil), ErrInvalidPayload) {
+			t.Fatal("nil write accepted")
+		}
+		if !errors.Is(op(t.Context(), &keyedData{ID: "other"}), ErrInvalidPayload) {
+			t.Fatal("mismatched key accepted")
+		}
+		if err := op(t.Context(), &keyedData{}); err == nil || errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("definitive rejection misclassified: %v", err)
+		}
+		if l.Context().Err() != nil {
+			t.Fatalf("known non-write lost ownership: %v", context.Cause(l.Context()))
+		}
 	}
+}
+
+func TestProtocolValidationDoesNotCallAWS(t *testing.T) {
+	client := protocolClient(func(context.Context, wireRequest) (int, any, error) {
+		t.Error("invalid input reached AWS")
+		return 0, nil, errors.New("unexpected request")
+	})
+	if _, _, err := Lock[keyedData](t.Context(), client, nil); err == nil {
+		t.Fatal("nil input accepted")
+	}
+	if _, _, err := Lock[int](t.Context(), client, protocolInput()); !errors.Is(err, ErrInvalidPayload) {
+		t.Fatal(err)
+	}
+	for _, change := range []func(*LockInput){
+		func(in *LockInput) { in.Table = "" },
+		func(in *LockInput) { in.ID = "" },
+		func(in *LockInput) { in.ID = strings.Repeat("x", 2049) },
+		func(in *LockInput) { in.HeartbeatInterval = in.HeartbeatMaxAge },
+		func(in *LockInput) { in.HeartbeatInterval = 0 },
+		func(in *LockInput) { in.Retries = -1 },
+		func(in *LockInput) { in.RetriesSleep = -1 },
+	} {
+		in := protocolInput()
+		change(in)
+		if _, _, err := Lock[keyedData](t.Context(), client, in); err == nil {
+			t.Fatalf("invalid input accepted: %#v", in)
+		}
+	}
+}
+
+func TestProtocolReadUnwrapsIdentity(t *testing.T) {
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.Target != "DynamoDB_20120810.GetItem" || !w.ConsistentRead {
+			return 0, nil, errors.New("Read must be a strong GetItem")
+		}
+		return 200, `{"Item":{"id":{"S":"key"},"data":{"M":{"value":{"S":"read"}}}}}`, nil
+	})
+	data, err := Read[keyedData](t.Context(), client, "table", "key")
+	if err != nil || !reflect.DeepEqual(data, &keyedData{ID: "key", Value: "read"}) {
+		t.Fatalf("Read: %#v %v", data, err)
+	}
+}
+
+func TestProtocolRequireExistingAndContention(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprint(missing), func(t *testing.T) {
+			calls := 0
+			client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+				calls++
+				if !strings.Contains(w.ConditionExpression, "attribute_exists(#id)") || w.ReturnValuesOnConditionCheckFailure != "ALL_OLD" {
+					return 0, nil, errors.New("required existence is not conditional")
+				}
+				if missing {
+					return 400, conditionalJSON, nil
+				}
+				return 400, `{"__type":"ConditionalCheckFailedException","Item":{"id":{"S":"key"},"owner_token":{"S":"other"},"expires_at":{"N":"9223372036854775807"}}}`, nil
+			})
+			in := protocolInput()
+			in.RequireExisting, in.Retries, in.RetriesSleep = true, 2, time.Nanosecond
+			_, _, err := Lock[keyedData](t.Context(), client, in)
+			want, attempts := ErrLockHeld, 3
+			if missing {
+				want, attempts = ErrLockNotFound, 1
+			}
+			if !errors.Is(err, want) || !errors.Is(err, ErrLockUnavailable) || calls != attempts {
+				t.Fatalf("existence/contention: %v calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestProtocolAmbiguousAcquireMalformedPayloadCleansUp(t *testing.T) {
+	var saved map[string]json.RawMessage
+	var releases int
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			saved = acquiredItem(w, "")
+			saved["data"] = json.RawMessage(`{"S":"not a map"}`)
+			return 500, serverErrorJSON, nil
+		}
+		if w.Target == "DynamoDB_20120810.GetItem" {
+			return 200, map[string]any{"Item": saved}, nil
+		}
+		releases++
+		return 200, `{}`, nil
+	})
+	l, _, err := Lock[keyedData](t.Context(), client, protocolInput())
+	if l != nil || !errors.Is(err, ErrInvalidRecord) || releases != 1 {
+		t.Fatalf("known ownership with malformed payload was abandoned: lease=%v releases=%d err=%v", l, releases, err)
+	}
+}
+
+func TestProtocolReleaseFailureKeepsHeartbeat(t *testing.T) {
+	var releases atomic.Int32
+	renewed := make(chan struct{}, 1)
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		if w.ExpressionAttributeValues[":next"] != nil {
+			select {
+			case renewed <- struct{}{}:
+			default:
+			}
+			return 200, `{}`, nil
+		}
+		if releases.Add(1) == 1 {
+			return 400, rejectedJSON, nil
+		}
+		return 200, `{}`, nil
+	})
+	in := protocolInput()
+	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 10*time.Millisecond
+	l, _, err := Lock[keyedData](t.Context(), client, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
+	if err := l.Release(t.Context()); err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		t.Fatalf("rejected release: %v", err)
+	}
+	await(t, renewed)
+	if l.Context().Err() != nil {
+		t.Fatal(context.Cause(l.Context()))
+	}
+	if err := l.Release(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProtocolContentionRetryTiming(t *testing.T) {
+	for _, retries := range []int{0, 1, 2, 3} {
+		t.Run(fmt.Sprint(retries), func(t *testing.T) {
+			calls := 0
+			client := protocolClient(func(context.Context, wireRequest) (int, any, error) { calls++; return 400, conditionalJSON, nil })
+			in := protocolInput()
+			in.Retries, in.RetriesSleep = retries, 10*time.Millisecond
+			started := time.Now()
+			_, _, err := Lock[keyedData](t.Context(), client, in)
+			if !errors.Is(err, ErrLockHeld) || calls != retries+1 || time.Since(started) < time.Duration(retries)*in.RetriesSleep {
+				t.Fatalf("contention retries: err=%v calls=%d elapsed=%s", err, calls, time.Since(started))
+			}
+		})
+	}
+	t.Run("default sleep is cancelable", func(t *testing.T) {
+		calls := 0
+		client := protocolClient(func(context.Context, wireRequest) (int, any, error) { calls++; return 400, conditionalJSON, nil })
+		in := protocolInput()
+		in.Retries = 1
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		_, _, err := Lock[keyedData](ctx, client, in)
+		if !errors.Is(err, context.DeadlineExceeded) || calls != 1 {
+			t.Fatalf("default contention delay: %v calls=%d", err, calls)
+		}
+	})
+}
+
+func TestProtocolCanceledCallDoesNotLoseLiveLease(t *testing.T) {
+	var calls atomic.Int32
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		calls.Add(1)
+		if w.ReturnValues == "ALL_NEW" {
+			return acquireReply(w, "")
+		}
+		return 200, `{}`, nil
+	})
+	l, _, err := Lock[keyedData](t.Context(), client, protocolInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanupLease(t, l)
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	err = unlock(context.Background(), &Data{Value: "test-cancel"})
-	if err != nil {
-		t.Fatal(err)
+	for range 100 {
+		if err := l.Release(ctx); !errors.Is(err, context.Canceled) || errors.Is(err, ErrOutcomeUnknown) {
+			t.Fatalf("already-canceled call was treated as an ambiguous write: %v", err)
+		}
+		if l.Context().Err() != nil {
+			t.Fatalf("canceled cleanup lost a live lease: %v", context.Cause(l.Context()))
+		}
 	}
-	read, err := Read[Data](context.Background(), table, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read == nil {
-		t.Fatal("expected data written during unlock")
-	}
-	if read.Value != "test-cancel" {
-		t.Fatalf("expected unlock data, got %q", read.Value)
+	if calls.Load() != 1 {
+		t.Fatalf("canceled calls reached HTTP: %d", calls.Load())
 	}
 }
 
-func TestContextCancelExpired(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
+func TestEnvelopeIdentityCannotBeShadowedByCaseAlias(t *testing.T) {
+	for _, alias := range []string{"ID", "Id", "iD"} {
+		t.Run(alias, func(t *testing.T) {
+			valid, err := MarshalItem("key", map[string]any{alias: "key"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := UnmarshalItem[keyedData](valid)
+			if err != nil || data == nil || data.ID != "key" || len(valid["data"].(*types.AttributeValueMemberM).Value) != 0 {
+				t.Fatalf("matching alias was not normalized to the outer identity: %#v %v", data, err)
+			}
+			if _, err := MarshalItem("key", map[string]any{alias: "other"}); !errors.Is(err, ErrInvalidPayload) {
+				t.Fatalf("SDK's case-insensitive ID alias bypassed identity validation: %v", err)
+			}
+			item := key("key")
+			item["data"] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{alias: &types.AttributeValueMemberS{Value: "other"}}}
+			if _, err := UnmarshalItem[keyedData](item); !errors.Is(err, ErrInvalidRecord) {
+				t.Fatalf("stored alias could override the injected identity: %v", err)
+			}
+		})
 	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(context.Background(), table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	unlock, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = unlock(context.Background(), nil) }()
-	cancel()
-	time.Sleep(5 * time.Second)
-	unlock, _, _, err = Lock[Data](context.Background(), &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("context was canceled, lock should have expired")
-	}
-	_ = unlock(context.Background(), nil)
-}
-
-func TestUnlockWithNil(t *testing.T) {
-	ctx := context.Background()
-	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	unlock, _, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data != nil {
-		t.Fatalf("expected nil data for a fresh lock")
-	}
-	err = unlock(ctx, nil)
-	if err != nil {
-		t.Fatalf("expected no error unlocking with nil data, got: %v", err)
-	}
-	read, err := Read[Data](ctx, table, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read == nil {
-		t.Fatalf("expected data")
-	}
-	if read.Value != "" {
-		t.Fatalf("expected zero value")
-	}
-}
-
-func TestUpdateWithNil(t *testing.T) {
-	ctx := context.Background()
-	table := "test-go-dynamolock-" + uuid.Must(uuid.NewV4()).String()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-	unlock, update, data, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data != nil {
-		t.Fatalf("expected nil data for a fresh lock")
-	}
-	err = update(ctx, nil)
-	if err != nil {
-		t.Fatalf("expected no error updating with nil data, got: %v", err)
-	}
-	read, err := Read[Data](ctx, table, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read == nil {
-		t.Fatalf("expected data")
-	}
-	if read.Value != "" {
-		t.Fatalf("expected zero value")
-	}
-	err = unlock(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLockRejectsEqualHeartbeatMaxAgeAndInterval(t *testing.T) {
-	_, _, _, err := Lock[Data](context.Background(), &LockInput{
-		Table:             "validation",
-		ID:                "validation",
-		HeartbeatMaxAge:   time.Second,
-		HeartbeatInterval: time.Second,
-	})
-	if err == nil {
-		t.Fatal("expected heartbeat max age equal to interval to fail")
-	}
-	if !strings.Contains(err.Error(), "heartbeat max age should be greater than heartbeat interval") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLockRetriesWhenHeldNotExpired(t *testing.T) {
-	assertRetryAttempts(t, 2, time.Nanosecond)
-}
-
-func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(table)
-	err = lib.DynamoDBWaitForReady(ctx, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := Uid()
-
-	// First acquire lock with short expiration
-	cancelCtx, cancel := context.WithCancel(ctx)
-	_, _, _, err = Lock[Data](cancelCtx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel() // leave lock in use
-
-	// Try to acquire lock with retries, should succeed after expiration
-	unlock2, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             table,
-		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           10,
-		RetriesSleep:      500 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("expected lock acquisition to succeed after expiration, got: %v", err)
-	}
-	_ = unlock2(ctx, nil)
-}
-
-func TestLockFailsAfterExhaustingRetries(t *testing.T) {
-	assertRetryAttempts(t, 1, time.Nanosecond)
-}
-
-func TestLockUsesCustomRetriesSleep(t *testing.T) {
-	duration := assertRetryAttempts(t, 3, 10*time.Millisecond)
-	if duration < 30*time.Millisecond {
-		t.Fatalf("expected custom retry sleep to delay at least 30ms, got %s", duration)
-	}
-}
-
-func TestLockUsesDefaultSleepWhenNotProvided(t *testing.T) {
-	originalClient := dynamoDBClient
-	t.Cleanup(func() { dynamoDBClient = originalClient })
-	checkClient := &retryCheckClient{}
-	dynamoDBClient = newRetryCheckDynamoDBClient(checkClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	_, _, _, err := Lock[Data](ctx, &LockInput{
-		Table:             "retry-check",
-		ID:                "retry-check",
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           1,
-	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected context deadline while waiting on default retry sleep, got: %v", err)
-	}
-	if got := atomic.LoadInt32(&checkClient.attempts); got != 1 {
-		t.Fatalf("expected 1 acquire attempt before default retry sleep, got %d", got)
-	}
-}
-
-func TestLockWithZeroRetriesFailsImmediately(t *testing.T) {
-	assertRetryAttempts(t, 0, time.Nanosecond)
-}
-
-func TestLockRetryCounterIncrementsCorrectly(t *testing.T) {
-	assertRetryAttempts(t, 3, time.Nanosecond)
 }
