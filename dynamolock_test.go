@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"reflect"
@@ -28,7 +29,7 @@ import (
 func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
 	const helper = "DYNAMOLOCK_TEST_UNARMED_HELPER"
 	if os.Getenv(helper) == "1" {
-		checkAccount(t)
+		liveClient(t)
 		return
 	}
 
@@ -48,6 +49,70 @@ func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
 	cmd.Env = append(os.Environ(), helper+"=1")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("unarmed live test reached the provider: %v\n%s", err, output)
+	}
+}
+
+func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
+	const helper = "DYNAMOLOCK_TEST_ARMED_HELPER"
+	if os.Getenv(helper) == "1" {
+		if _, err := setup(t, "offline-gate"); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	for _, expected := range []string{"111111111111", "222222222222"} {
+		t.Run(expected, func(t *testing.T) {
+			var identityCalls, mutations atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("X-Amz-Target") == "DynamoDB_20120810.CreateTable" {
+					mutations.Add(1)
+					if identityCalls.Load() != 1 {
+						t.Error("DynamoDB mutation preceded account verification")
+					}
+					w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+					if _, err := io.WriteString(w, `{}`); err != nil {
+						t.Error(err)
+					}
+					return
+				}
+				if err := r.ParseForm(); err != nil || r.Form.Get("Action") != "GetCallerIdentity" {
+					t.Errorf("unexpected SDK request: %s %v", r.Header.Get("X-Amz-Target"), err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				identityCalls.Add(1)
+				w.Header().Set("Content-Type", "text/xml")
+				if _, err := io.WriteString(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111111111111</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer server.Close()
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestArmedLiveGateChecksAccountBeforeMutation$")
+			for _, entry := range os.Environ() {
+				if !strings.HasPrefix(entry, "AWS_") && !strings.HasPrefix(entry, "DYNAMOLOCK_TEST_ACCOUNT=") && !strings.HasPrefix(entry, "REUSE=") && !strings.HasPrefix(entry, helper+"=") {
+					cmd.Env = append(cmd.Env, entry)
+				}
+			}
+			cmd.Env = append(cmd.Env, helper+"=1", "DYNAMOLOCK_TEST_ACCOUNT="+expected,
+				"AWS_ACCESS_KEY_ID=test", "AWS_SECRET_ACCESS_KEY=test", "AWS_REGION=us-west-2",
+				"AWS_CONFIG_FILE="+os.DevNull, "AWS_SHARED_CREDENTIALS_FILE="+os.DevNull,
+				"AWS_EC2_METADATA_DISABLED=true", "AWS_MAX_ATTEMPTS=1", "AWS_ENDPOINT_URL="+server.URL)
+			output, err := cmd.CombinedOutput()
+			if expected == "111111111111" {
+				if err != nil || mutations.Load() != 1 {
+					t.Fatalf("matching account did not reach DynamoDB: mutations=%d err=%v\n%s", mutations.Load(), err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), "AWS account mismatch") || mutations.Load() != 0 {
+				t.Fatalf("wrong-account gate failed: mutations=%d err=%v\n%s", mutations.Load(), err, output)
+			}
+			if identityCalls.Load() != 1 {
+				t.Fatalf("account checks = %d, want 1", identityCalls.Load())
+			}
+		})
 	}
 }
 

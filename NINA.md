@@ -26,6 +26,8 @@ Read [readme.md](readme.md) before changing the lease protocol or public API.
   Lost handles may only perform token-conditional release cleanup.
 - Production uses the caller's DynamoDB SDK client, with no libaws/config/logging
   dependency. SDK retries are disabled per request; library retries are bounded.
+- Live fixtures use direct SDK clients: STS checks and DynamoDB operations share
+  the same per-fixture configuration. No libaws dependency remains, even in tests.
 - These guarantees do not fence external effects or eliminate clock-skew risks.
 
 ## Validation
