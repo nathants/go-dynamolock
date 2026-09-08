@@ -66,8 +66,8 @@ func liveTable(t *testing.T) (*dynamodb.Client, string) {
 	return client, table
 }
 
-// The client has already passed the account gate. Cleanup policy belongs to
-// this fixture, not to whatever REUSE contains when the test finishes.
+// setupTable requires an account-checked client. Keep the captured reuse mode
+// for cleanup so later environment changes cannot switch clearing and deletion.
 func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
@@ -324,6 +324,7 @@ func TestReadModifyWrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Local exclusion is not enough: the stored counter must include every worker.
 	stored, err := Read[counter](ctx, client, table, id)
 	if err != nil || stored == nil || stored.Count != max {
 		t.Fatalf("persisted counter = %#v, err = %v; want %d", stored, err, max)
@@ -469,7 +470,7 @@ func (c lockAcquireDelayClient) Do(req *http.Request) (*http.Response, error) {
 func TestData(t *testing.T) {
 	ctx := t.Context()
 	client, table := liveTable(t)
-	id := Uid() // new id means empty data
+	id := Uid()
 	unlock, data, err := Lock[testData](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
@@ -935,7 +936,6 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 
-	// First acquire lock with short expiration
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	first, _, err := Lock[Data](cancelCtx, client, &LockInput{
@@ -948,9 +948,9 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cancel() // leave lock in use
+	// Stop renewal without releasing: acquisition must wait for the stored expiry.
+	cancel()
 
-	// Try to acquire lock with retries, should succeed after expiration
 	unlock2, _, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
@@ -972,8 +972,9 @@ func liveInput(table string) *LockInput {
 	return &LockInput{Table: table, ID: Uid(), HeartbeatMaxAge: 2 * time.Second, HeartbeatInterval: 200 * time.Millisecond}
 }
 
-// Replace exactly one successful write response, AFTER DynamoDB applied it.
-// This tests real service conditions and reconciliation, not a mock state store.
+// loseAWSResponse lets DynamoDB apply one matching request, then substitutes an
+// error for the successful response. Failing before the write would not exercise
+// reconciliation of an ambiguous result.
 func loseAWSResponse(t *testing.T, client *dynamodb.Client, match func(wireRequest) bool) (*dynamodb.Client, *atomic.Int32) {
 	t.Helper()
 	injected := &atomic.Int32{}

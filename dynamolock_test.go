@@ -360,6 +360,8 @@ const conditionalJSON = `{"__type":"ConditionalCheckFailedException","message":"
 const serverErrorJSON = `{"__type":"InternalServerError","message":"response lost"}`
 const rejectedJSON = `{"__type":"ValidationException","message":"rejected before applying"}`
 
+// protocolClient runs the real SDK against scripted HTTP replies. It exposes
+// requests but does not evaluate DynamoDB conditions; live tests cover those.
 func protocolClient(fn func(context.Context, wireRequest) (int, any, error)) *dynamodb.Client {
 	return dynamodb.New(dynamodb.Options{
 		Region: "us-east-1",
@@ -402,8 +404,6 @@ func protocolClient(fn func(context.Context, wireRequest) (int, any, error)) *dy
 	})
 }
 
-// These are scripted responses, not a DynamoDB condition evaluator or a second
-// implementation of the lock. Live tests validate the actual conditions.
 func acquiredItem(w wireRequest, data string) map[string]json.RawMessage {
 	item := map[string]json.RawMessage{
 		"id": w.Key["id"], "owner_token": w.ExpressionAttributeValues[":owner"],
@@ -441,6 +441,8 @@ func await(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
+// Register after table setup: t.Cleanup runs in reverse order, so leases must
+// release and join their heartbeats before the fixture clears or deletes data.
 func cleanupLease[T any](t *testing.T, l *Lease[T]) {
 	t.Helper()
 	if l == nil {

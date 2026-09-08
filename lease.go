@@ -48,13 +48,15 @@ func newLease[T any](ctx context.Context, client *dynamodb.Client, in LockInput,
 }
 
 // Context is canceled on parent cancellation, loss, or successful completion.
-// context.Cause supplies the reason. Its cancellation cannot undo an external
-// effect or a DynamoDB request that was already in flight.
+// Protected work must stop on cancellation; context.Cause supplies the reason.
+// Cancellation cannot undo external effects or in-flight DynamoDB requests.
 func (l *Lease[T]) Context() context.Context { return l.ctx }
 
 // ID returns the immutable primary key shared by the lease and its payload.
 func (l *Lease[T]) ID() string { return l.input.ID }
 
+// Enforce the last confirmed monotonic deadline independently of the heartbeat
+// goroutine, even if a request is stuck in the transport.
 func (l *Lease[T]) armDeadlineLocked() {
 	if l.timer != nil {
 		l.timer.Stop()
@@ -135,6 +137,8 @@ func (l *Lease[T]) heartbeat() {
 	}
 }
 
+// Every retry gets a fresh proposed expiry but shares the last confirmed
+// deadline. An unconfirmed request cannot extend the local lease budget.
 func (l *Lease[T]) renew() error {
 	l.mu.Lock()
 	deadline, confirmedExpiry := l.deadline, l.expires
@@ -257,6 +261,8 @@ func (l *Lease[T]) write(ctx context.Context, data *T, commit bool) error {
 	if err := l.liveError(); err != nil {
 		return err
 	}
+	// Custom marshaling can outlast the lease and cannot be interrupted here.
+	// Recheck liveness afterward before submitting a write.
 	payload, err := marshalPayload(l.input.ID, data)
 	if err != nil {
 		return err

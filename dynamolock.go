@@ -40,20 +40,20 @@ var ErrReleased = errors.New("lease released")
 // writes. Release-only cleanup is still allowed with a fresh context.
 var ErrOutcomeUnknown = errors.New("write outcome unknown")
 
-// LockInput is copied by Lock. Its table, key, and timing must not be changed
-// during that call, but the caller may freely reuse it after Lock returns.
+// LockInput configures acquisition and renewal. Lock copies it before use;
+// callers may reuse it after Lock returns, but must not mutate it during Lock.
 type LockInput struct {
 	Table             string
 	ID                string
-	RequireExisting   bool
+	RequireExisting   bool          // Check item existence, not payload presence.
 	HeartbeatMaxAge   time.Duration // Duration of each lease, established by its holder.
 	HeartbeatInterval time.Duration // Measured from the last confirmed request's start.
 	Retries           int           // Additional attempts after ordinary contention.
 	RetriesSleep      time.Duration // Zero uses one second.
 }
 
-// Read returns the latest committed payload without acquiring ownership. Reads
-// are strongly consistent, but do not make a subsequent external read atomic.
+// Read performs a strongly consistent payload read without taking a lease.
+// It can observe Update before Commit or Release.
 func Read[T any](ctx context.Context, client *dynamodb.Client, table, id string) (*T, error) {
 	if err := validateTarget(ctx, client, table, id); err != nil {
 		return nil, err
@@ -68,13 +68,13 @@ func Read[T any](ctx context.Context, client *dynamodb.Client, table, id string)
 	return UnmarshalItem[T](item)
 }
 
-// Lock atomically acquires ownership and reads the payload. The context owns
-// the entire lease lifetime, not just acquisition. Work must use Lease.Context
-// and stop when it is canceled. Missing data returns nil even for a metadata-only
-// existing item; RequireExisting tests the existence of the item, not its data.
+// Lock atomically acquires ownership and returns the payload. The context owns
+// the entire lease lifetime; cancellation stops renewal but does not release
+// the item. Missing data returns nil even when RequireExisting succeeds.
 //
-// The client must honor request contexts. SDK retries are disabled per request;
-// this package alone retries, bounded by the caller or confirmed lease lifetime.
+// T must be a struct or string-keyed map. The client's transport must honor
+// request contexts. Custom codecs run synchronously and must return promptly;
+// this package cannot cancel them.
 func Lock[T any](ctx context.Context, client *dynamodb.Client, input *LockInput) (lease *Lease[T], data *T, err error) {
 	if input == nil {
 		return nil, nil, errors.New("nil LockInput")
@@ -155,6 +155,8 @@ func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner s
 		started := time.Now()
 		expires := started.Add(in.HeartbeatMaxAge)
 		attemptCtx, cancel := context.WithDeadline(ctx, expires)
+		// Compare the holder's deadline without rounding or including equality.
+		// A contender's lease duration must not affect when takeover is allowed.
 		condition := "((attribute_not_exists(#owner) AND attribute_not_exists(#expires)) OR #expires < :now)"
 		if in.RequireExisting {
 			condition = "attribute_exists(#id) AND " + condition
@@ -231,6 +233,8 @@ func acquisitionConfirmed(item map[string]types.AttributeValue, id, owner string
 
 const maxAttempts = 5
 
+// Library retries account for write ambiguity and lease deadlines. SDK retries
+// would resend requests without those checks.
 func noSDKRetry(options *dynamodb.Options) {
 	options.Retryer = aws.NopRetryer{}
 	options.RetryMaxAttempts = 1

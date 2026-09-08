@@ -23,10 +23,10 @@ type LockKey struct {
 	ID string `json:"id" dynamodbav:"id"`
 }
 
-// MarshalItem encodes an unlocked item for a conditional create or an import.
-// It does not authorize overwriting an existing item or bypassing its lease.
-// Data must encode as a DynamoDB map. A missing/empty data.id uses id; a
-// conflicting or non-string data.id is rejected. Only the outer id is stored.
+// MarshalItem encodes an unlocked envelope without writing to DynamoDB.
+// Use attribute_not_exists(id) when inserting it with PutItem.
+// Nil data and non-map encodings are rejected. A missing or empty data.id uses
+// id; a conflicting or non-string data.id is rejected. Only the outer id is stored.
 func MarshalItem(id string, data any) (map[string]types.AttributeValue, error) {
 	payload, err := marshalPayload(id, data)
 	if err != nil {
@@ -37,12 +37,12 @@ func MarshalItem(id string, data any) (map[string]types.AttributeValue, error) {
 	return item, nil
 }
 
-// UnmarshalItem decodes a complete item, or a projection including id and data.
-// The outer id is injected into the decoded payload; the input map is unchanged.
-// An absent item or absent data returns nil. An explicitly empty data map returns
-// a non-nil value. Flat legacy records and duplicated data.id are rejected.
-// Numbers decoded into interface values use attributevalue.Number to preserve
-// precision. Explicitly typed numeric fields keep their declared Go types.
+// UnmarshalItem decodes an envelope, or a projection including id and data,
+// into a struct or string-keyed map T. The input map is unchanged.
+// The outer id is injected before decoding, so map values must accept a string.
+// An absent item or absent data returns nil; empty data returns a non-nil value.
+// Interface numbers use attributevalue.Number to preserve precision; typed
+// numeric fields keep their declared Go types.
 func UnmarshalItem[T any](item map[string]types.AttributeValue) (*T, error) {
 	if err := validateType[T](); err != nil {
 		return nil, err
