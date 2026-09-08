@@ -29,7 +29,7 @@ import (
 func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
 	const helper = "DYNAMOLOCK_TEST_UNARMED_HELPER"
 	if os.Getenv(helper) == "1" {
-		liveClient(t)
+		liveTable(t)
 		return
 	}
 
@@ -55,7 +55,12 @@ func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
 func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
 	const helper = "DYNAMOLOCK_TEST_ARMED_HELPER"
 	if os.Getenv(helper) == "1" {
-		if _, err := setup(t, "offline-gate"); err != nil {
+		client := liveClient(t)
+		if _, err := client.CreateTable(t.Context(), &dynamodb.CreateTableInput{
+			TableName: aws.String("offline-gate"), BillingMode: types.BillingModePayPerRequest,
+			AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS}},
+			KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash}},
+		}); err != nil {
 			t.Fatal(err)
 		}
 		return
@@ -71,6 +76,7 @@ func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
 						t.Error("DynamoDB mutation preceded account verification")
 					}
 					w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+					w.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(`{}`))), 10))
 					if _, err := io.WriteString(w, `{}`); err != nil {
 						t.Error(err)
 					}
@@ -92,15 +98,7 @@ func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestArmedLiveGateChecksAccountBeforeMutation$")
-			for _, entry := range os.Environ() {
-				if !strings.HasPrefix(entry, "AWS_") && !strings.HasPrefix(entry, "DYNAMOLOCK_TEST_ACCOUNT=") && !strings.HasPrefix(entry, "REUSE=") && !strings.HasPrefix(entry, helper+"=") {
-					cmd.Env = append(cmd.Env, entry)
-				}
-			}
-			cmd.Env = append(cmd.Env, helper+"=1", "DYNAMOLOCK_TEST_ACCOUNT="+expected,
-				"AWS_ACCESS_KEY_ID=test", "AWS_SECRET_ACCESS_KEY=test", "AWS_REGION=us-west-2",
-				"AWS_CONFIG_FILE="+os.DevNull, "AWS_SHARED_CREDENTIALS_FILE="+os.DevNull,
-				"AWS_EC2_METADATA_DISABLED=true", "AWS_MAX_ATTEMPTS=1", "AWS_ENDPOINT_URL="+server.URL)
+			cmd.Env = append(offlineAWSEnv(server.URL, expected), helper+"=1")
 			output, err := cmd.CombinedOutput()
 			if expected == "111111111111" {
 				if err != nil || mutations.Load() != 1 {
@@ -116,6 +114,229 @@ func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
 	}
 }
 
+func offlineAWSEnv(endpoint, expected string) []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "AWS_") && !strings.HasPrefix(entry, "DYNAMOLOCK_TEST_") && !strings.HasPrefix(entry, "REUSE=") {
+			env = append(env, entry)
+		}
+	}
+	return append(env, "DYNAMOLOCK_TEST_ACCOUNT="+expected,
+		"AWS_ACCESS_KEY_ID=test", "AWS_SECRET_ACCESS_KEY=test", "AWS_REGION=us-west-2",
+		"AWS_CONFIG_FILE="+os.DevNull, "AWS_SHARED_CREDENTIALS_FILE="+os.DevNull,
+		"AWS_EC2_METADATA_DISABLED=true", "AWS_MAX_ATTEMPTS=1", "AWS_ENDPOINT_URL="+endpoint)
+}
+
+func TestLiveFixtureLifecycle(t *testing.T) {
+	const helper = "DYNAMOLOCK_TEST_FIXTURE_HELPER"
+	if scenario := os.Getenv(helper); scenario != "" {
+		client := liveClient(t)
+		setupTable(t, client, "fixture-table", os.Getenv("REUSE") != "")
+		if scenario == "failed_lease" {
+			lease, _, err := Lock[Data](t.Context(), client, &LockInput{
+				Table: "fixture-table", ID: "lock", HeartbeatMaxAge: 2 * time.Minute, HeartbeatInterval: time.Minute,
+			})
+			cleanupLease(t, lease)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if scenario == "changed_reuse" || scenario == "changed_reuse_off" {
+			value := "1"
+			if scenario == "changed_reuse_off" {
+				value = ""
+			}
+			// This is an isolated subprocess: leave the changed environment in
+			// place through cleanup, rather than restoring it with t.Setenv.
+			if err := os.Setenv("REUSE", value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if scenario == "failed_test" || scenario == "failed_lease" {
+			t.Fatal("deliberate test failure")
+		}
+		return
+	}
+
+	for _, tc := range []struct {
+		name                     string
+		reuse, exists, wantFail  bool
+		deletes, scans, releases int32
+	}{
+		{name: "disposable", deletes: 1},
+		{name: "changed_reuse", deletes: 1},
+		{name: "lost_create_response", wantFail: true, deletes: 1},
+		{name: "failed_wait", wantFail: true, deletes: 1},
+		{name: "delete_error", wantFail: true, deletes: 1},
+		{name: "delete_wait_error", wantFail: true, deletes: 1},
+		{name: "failed_test", wantFail: true, deletes: 1},
+		{name: "failed_lease", wantFail: true, deletes: 1, releases: 1},
+		{name: "reused_new", reuse: true, scans: 2},
+		{name: "reused", reuse: true, exists: true, scans: 2},
+		{name: "changed_reuse_off", reuse: true, exists: true, scans: 2},
+		{name: "failed_clear", reuse: true, exists: true, wantFail: true, scans: 2},
+		{name: "collision", exists: true, wantFail: true},
+		{name: "racing_create", wantFail: true},
+		{name: "wrong_schema", reuse: true, exists: true, wantFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var exists atomic.Bool
+			exists.Store(tc.exists)
+			var descriptions, deletes, scans, releases atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reply := func(status int, body string) {
+					w.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE([]byte(body))), 10))
+					w.WriteHeader(status)
+					if _, err := io.WriteString(w, body); err != nil {
+						t.Error(err)
+					}
+				}
+				if r.Header.Get("X-Amz-Target") == "" {
+					if err := r.ParseForm(); err != nil || r.Form.Get("Action") != "GetCallerIdentity" {
+						t.Errorf("unexpected identity request: %v", err)
+					}
+					w.Header().Set("Content-Type", "text/xml")
+					reply(200, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111111111111</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`)
+					return
+				}
+				w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+				switch r.Header.Get("X-Amz-Target") {
+				case "DynamoDB_20120810.CreateTable":
+					if exists.Swap(true) || tc.name == "racing_create" {
+						reply(400, `{"__type":"ResourceInUseException"}`)
+					} else if tc.name == "lost_create_response" {
+						reply(500, serverErrorJSON)
+					} else {
+						reply(200, `{}`)
+					}
+				case "DynamoDB_20120810.DescribeTable":
+					if descriptions.Add(1) == 2 && tc.name == "failed_wait" || deletes.Load() != 0 && tc.name == "delete_wait_error" {
+						reply(400, rejectedJSON)
+						return
+					}
+					if !exists.Load() {
+						reply(400, `{"__type":"ResourceNotFoundException"}`)
+						return
+					}
+					keyName := "id"
+					if tc.name == "wrong_schema" {
+						keyName = "other"
+					}
+					reply(200, fmt.Sprintf(`{"Table":{"TableStatus":"ACTIVE","KeySchema":[{"AttributeName":%q,"KeyType":"HASH"}],"AttributeDefinitions":[{"AttributeName":%q,"AttributeType":"S"}]}}`, keyName, keyName))
+				case "DynamoDB_20120810.DeleteTable":
+					if releases.Load() != tc.releases {
+						t.Error("table deletion preceded lease cleanup")
+					}
+					deletes.Add(1)
+					if tc.name == "delete_error" {
+						reply(400, `{"__type":"AccessDeniedException","message":"delete denied"}`)
+					} else {
+						exists.Store(false)
+						reply(200, `{}`)
+					}
+				case "DynamoDB_20120810.UpdateItem":
+					var request wireRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+						return
+					}
+					if request.ReturnValues == "ALL_NEW" {
+						body, err := json.Marshal(map[string]any{"Attributes": acquiredItem(request, "")})
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						reply(200, string(body))
+					} else if request.UpdateExpression == "REMOVE #owner, #expires" {
+						releases.Add(1)
+						reply(200, `{}`)
+					} else {
+						t.Errorf("unexpected fixture lease write: %s", request.UpdateExpression)
+						reply(400, rejectedJSON)
+					}
+				case "DynamoDB_20120810.Scan":
+					if scans.Add(1) == 1 && tc.name == "failed_clear" {
+						reply(400, rejectedJSON)
+					} else {
+						reply(200, `{"Items":[]}`)
+					}
+				default:
+					t.Errorf("unexpected fixture request: %s", r.Header.Get("X-Amz-Target"))
+					reply(400, rejectedJSON)
+				}
+			}))
+			defer server.Close()
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLiveFixtureLifecycle$")
+			cmd.Env = append(offlineAWSEnv(server.URL, "111111111111"), helper+"="+tc.name)
+			if tc.reuse {
+				cmd.Env = append(cmd.Env, "REUSE=1")
+			}
+			output, err := cmd.CombinedOutput()
+			if (err != nil) != tc.wantFail || ctx.Err() != nil {
+				t.Fatalf("fixture failure = %v, want failure %v\n%s", err, tc.wantFail, output)
+			}
+			if deletes.Load() != tc.deletes || scans.Load() != tc.scans || releases.Load() != tc.releases {
+				t.Fatalf("cleanup deletes=%d scans=%d releases=%d, want %d/%d/%d\n%s", deletes.Load(), scans.Load(), releases.Load(), tc.deletes, tc.scans, tc.releases, output)
+			}
+			if strings.Contains(string(output), "WARN") || strings.Contains(string(output), "panic:") {
+				t.Fatalf("unexpected subprocess diagnostic: %s", output)
+			}
+			if tc.name == "delete_error" && !strings.Contains(string(output), "delete denied") {
+				t.Fatalf("cleanup error was not reported: %s", output)
+			}
+		})
+	}
+}
+
+func TestClearTablePaginatesAndRetries(t *testing.T) {
+	var scans, batches int
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		switch w.Target {
+		case "DynamoDB_20120810.Scan":
+			scans++
+			if !w.ConsistentRead {
+				t.Error("cleanup scan must see completed writes")
+			}
+			switch scans {
+			case 1:
+				return 200, `{"Items":[{"id":{"S":"first"}}],"LastEvaluatedKey":{"id":{"S":"first"}}}`, nil
+			case 2:
+				if string(w.ExclusiveStartKey["id"]) != `{"S":"first"}` {
+					t.Errorf("second scan cursor: %s", w.ExclusiveStartKey["id"])
+				}
+				return 200, `{"Items":[],"LastEvaluatedKey":{"id":{"S":"gap"}}}`, nil
+			case 3:
+				if string(w.ExclusiveStartKey["id"]) != `{"S":"gap"}` {
+					t.Errorf("third scan cursor: %s", w.ExclusiveStartKey["id"])
+				}
+				return 200, `{"Items":[{"id":{"S":"last"}}]}`, nil
+			default:
+				t.Errorf("unexpected scan %d", scans)
+			}
+		case "DynamoDB_20120810.BatchWriteItem":
+			batches++
+			if len(w.RequestItems["table"]) != 1 {
+				t.Errorf("cleanup batch: %#v", w.RequestItems)
+			}
+			if batches == 1 {
+				return 200, map[string]any{"UnprocessedItems": w.RequestItems}, nil
+			}
+		default:
+			t.Errorf("unexpected cleanup request: %s", w.Target)
+		}
+		return 200, `{}`, nil
+	})
+	if err := ClearTable(t.Context(), client, "table"); err != nil {
+		t.Fatal(err)
+	}
+	if scans != 3 || batches != 3 {
+		t.Fatalf("scans=%d batches=%d, want 3 of each", scans, batches)
+	}
+}
+
 type httpFunc func(*http.Request) (*http.Response, error)
 
 func (f httpFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
@@ -123,6 +344,8 @@ func (f httpFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
 type wireRequest struct {
 	Target                              string `json:"-"`
 	TableName                           string
+	ExclusiveStartKey                   map[string]json.RawMessage
+	RequestItems                        map[string][]json.RawMessage
 	Key                                 map[string]json.RawMessage
 	ConditionExpression                 string
 	UpdateExpression                    string
@@ -220,12 +443,16 @@ func await(t *testing.T, ch <-chan struct{}) {
 
 func cleanupLease[T any](t *testing.T, l *Lease[T]) {
 	t.Helper()
+	if l == nil {
+		return
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if err := l.Release(ctx); err != nil {
 			t.Errorf("release test lease: %v", err)
 		}
+		await(t, l.done)
 	})
 }
 

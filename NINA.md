@@ -28,6 +28,11 @@ Read [readme.md](readme.md) before changing the lease protocol or public API.
   dependency. SDK retries are disabled per request; library retries are bounded.
 - Live fixtures use direct SDK clients: STS checks and DynamoDB operations share
   the same per-fixture configuration. No libaws dependency remains, even in tests.
+- All live tests use `liveTable`: disposable tables by default; REUSE selects
+  the dedicated `go-dynamolock` test table and clears it before/after each test.
+  Never run reusable-table suites concurrently. Cleanup policy is captured at
+  setup; test cancellation, worker joins, and lease cleanup precede table cleanup.
+  Cleanup is bounded and reported, including after setup failure.
 - These guarantees do not fence external effects or eliminate clock-skew risks.
 
 ## Validation

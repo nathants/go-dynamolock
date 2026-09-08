@@ -54,12 +54,104 @@ type Data struct {
 	Value string `json:"value" dynamodbav:"value"`
 }
 
-// helper functions for reusing a fixed test table when the REUSE env is set
-func getTableName() string {
-	if os.Getenv("REUSE") != "" {
-		return "go-dynamolock"
+func liveTable(t *testing.T) (*dynamodb.Client, string) {
+	t.Helper()
+	client := liveClient(t)
+	reuse := os.Getenv("REUSE") != ""
+	table := "test-go-dynamolock-" + Uid()
+	if reuse {
+		table = "go-dynamolock"
 	}
-	return "test-go-dynamolock-" + Uid()
+	setupTable(t, client, table, reuse)
+	return client, table
+}
+
+// The client has already passed the account gate. Cleanup policy belongs to
+// this fixture, not to whatever REUSE contains when the test finishes.
+func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	cleanup := false
+	t.Cleanup(func() {
+		if !cleanup {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		if err := cleanupTable(ctx, client, table, reuse); err != nil {
+			t.Errorf("cleanup test table %s: %v", table, err)
+		}
+	})
+	input := &dynamodb.CreateTableInput{
+		TableName: aws.String(table), BillingMode: types.BillingModePayPerRequest,
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash}},
+	}
+	out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
+	var absent *types.ResourceNotFoundException
+	switch {
+	case errors.As(err, &absent):
+		// Record responsibility before creation, including a lost response.
+		// Never delete an independently pre-existing disposable table.
+		cleanup = true
+		_, err := client.CreateTable(ctx, input, noSDKRetry)
+		if err != nil {
+			var collision *types.ResourceInUseException
+			if errors.As(err, &collision) {
+				cleanup = false // Another creator won; this request did not create it.
+			}
+			t.Fatalf("create test table %s: %v", table, err)
+		}
+	case err != nil:
+		t.Fatalf("inspect test table %s: %v", table, err)
+	case !reuse:
+		t.Fatalf("refusing pre-existing disposable test table %s", table)
+	case out.Table == nil || !reflect.DeepEqual(out.Table.KeySchema, input.KeySchema) || !reflect.DeepEqual(out.Table.AttributeDefinitions, input.AttributeDefinitions):
+		t.Fatalf("refusing to reuse table %s with a different key schema", table)
+	default:
+		cleanup = true
+	}
+	if err := waitForTable(ctx, client, table); err != nil {
+		t.Fatalf("wait for test table %s: %v", table, err)
+	}
+	if reuse {
+		if err := ClearTable(ctx, client, table); err != nil {
+			t.Fatalf("clear test table %s: %v", table, err)
+		}
+	}
+}
+
+func cleanupTable(ctx context.Context, client *dynamodb.Client, table string, reuse bool) error {
+	out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
+	var absent *types.ResourceNotFoundException
+	if errors.As(err, &absent) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if out.Table == nil {
+		return fmt.Errorf("missing table description")
+	}
+	if out.Table.TableStatus != types.TableStatusDeleting {
+		if err := waitForTable(ctx, client, table); err != nil {
+			return err
+		}
+		if reuse {
+			return ClearTable(ctx, client, table)
+		}
+		_, err := client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(table)})
+		if errors.As(err, &absent) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return dynamodb.NewTableNotExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)}, time.Minute, func(o *dynamodb.TableNotExistsWaiterOptions) {
+		o.MinDelay, o.MaxDelay = time.Second, 3*time.Second
+	})
 }
 
 func ClearTable(ctx context.Context, client *dynamodb.Client, table string) error {
@@ -96,17 +188,14 @@ func ClearTable(ctx context.Context, client *dynamodb.Client, table string) erro
 		return nil
 	}
 
-	for {
-		out, err := client.Scan(ctx, &dynamodb.ScanInput{
-			TableName:            aws.String(table),
-			ProjectionExpression: aws.String("id"),
-			Limit:                aws.Int32(128),
-		})
+	pages := dynamodb.NewScanPaginator(client, &dynamodb.ScanInput{
+		TableName: aws.String(table), ProjectionExpression: aws.String("id"),
+		ConsistentRead: aws.Bool(true), Limit: aws.Int32(128),
+	})
+	for pages.HasMorePages() {
+		out, err := pages.NextPage(ctx)
 		if err != nil {
 			return err
-		}
-		if len(out.Items) == 0 {
-			return nil
 		}
 		var reqs []types.WriteRequest
 		for _, item := range out.Items {
@@ -127,28 +216,8 @@ func ClearTable(ctx context.Context, client *dynamodb.Client, table string) erro
 				return err
 			}
 		}
-		if len(out.LastEvaluatedKey) == 0 {
-			return nil
-		}
 	}
-}
-
-func teardown(client *dynamodb.Client, table string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	if os.Getenv("REUSE") != "" {
-		_ = ClearTable(ctx, client, table)
-		return
-	}
-	if err := waitForTable(ctx, client, table); err != nil {
-		return
-	}
-	if _, err := client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(table)}); err != nil {
-		return
-	}
-	_ = dynamodb.NewTableNotExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)}, time.Minute, func(o *dynamodb.TableNotExistsWaiterOptions) {
-		o.MinDelay, o.MaxDelay = time.Second, 3*time.Second
-	})
+	return nil
 }
 
 func Uid() string {
@@ -161,67 +230,9 @@ func waitForTable(ctx context.Context, client *dynamodb.Client, table string) er
 	})
 }
 
-func setup(t *testing.T, table string) (*dynamodb.Client, error) {
-	t.Helper()
-	client := liveClient(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancel()
-	input := &dynamodb.CreateTableInput{
-		TableName:   aws.String(table),
-		BillingMode: types.BillingModePayPerRequest,
-		StreamSpecification: &types.StreamSpecification{
-			StreamEnabled: aws.Bool(false),
-		},
-		AttributeDefinitions: []types.AttributeDefinition{
-			{
-				AttributeName: aws.String("id"),
-				AttributeType: types.ScalarAttributeTypeS,
-			},
-		},
-		KeySchema: []types.KeySchemaElement{
-			{
-				AttributeName: aws.String("id"),
-				KeyType:       types.KeyTypeHash,
-			},
-		},
-	}
-	_, err := client.CreateTable(ctx, input)
-	var existing *types.ResourceInUseException
-	if err != nil {
-		if os.Getenv("REUSE") == "" || !errors.As(err, &existing) {
-			return nil, err
-		}
-		out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
-		if err != nil {
-			return nil, err
-		}
-		if out.Table == nil || !reflect.DeepEqual(out.Table.KeySchema, input.KeySchema) || !reflect.DeepEqual(out.Table.AttributeDefinitions, input.AttributeDefinitions) {
-			return nil, fmt.Errorf("refusing to reuse table %s with a different key schema", table)
-		}
-	}
-	if os.Getenv("REUSE") != "" {
-		if err := waitForTable(ctx, client, table); err != nil {
-			return nil, err
-		}
-		if err := ClearTable(ctx, client, table); err != nil {
-			return nil, err
-		}
-	}
-	return client, nil
-}
-
 func TestBasic(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
@@ -229,18 +240,20 @@ func TestBasic(t *testing.T) {
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if data != nil {
 		t.Fatalf("data should be nil")
 	}
-	_, _, err = Lock[Data](ctx, client, &LockInput{
+	contender, _, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, contender)
 	if err == nil {
 		t.Fatal("acquired lock twice")
 	}
@@ -256,16 +269,7 @@ func TestReadModifyWrite(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { teardown(client, table) })
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client, table := liveTable(t)
 	id := Uid()
 	max := 50
 	var inCriticalSection int32
@@ -292,6 +296,7 @@ func TestReadModifyWrite(t *testing.T) {
 					Retries:           5,
 					RetriesSleep:      1 * time.Second,
 				})
+				cleanupLease(t, lease)
 				if errors.Is(err, ErrLockHeld) {
 					continue
 				}
@@ -299,7 +304,6 @@ func TestReadModifyWrite(t *testing.T) {
 					done <- err
 					return
 				}
-				cleanupLease(t, lease)
 				if !atomic.CompareAndSwapInt32(&inCriticalSection, 0, 1) {
 					done <- fmt.Errorf("lock allowed concurrent critical sections")
 					return
@@ -331,18 +335,9 @@ type testData struct {
 }
 
 func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client, table := liveTable(t)
 
 	id := Uid()
 	unlock, _, err := Lock[Data](ctx, client, &LockInput{
@@ -351,6 +346,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 		HeartbeatMaxAge:   2 * time.Minute,
 		HeartbeatInterval: time.Minute,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +358,6 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 	seenAcquireAttempt := make(chan struct{}, 1)
 	releaseAcquire := make(chan struct{})
 	releaseDelayedAcquire := sync.OnceFunc(func() { close(releaseAcquire) })
-	t.Cleanup(releaseDelayedAcquire)
 	delayedClient := dynamodb.New(client.Options(), func(options *dynamodb.Options) {
 		options.HTTPClient = lockAcquireDelayClient{
 			base:               options.HTTPClient,
@@ -372,13 +367,19 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 	})
 
 	contenderCtx, cancelContender := context.WithCancel(ctx)
-	t.Cleanup(cancelContender)
+	finished := make(chan struct{})
+	defer func() {
+		cancelContender()
+		releaseDelayedAcquire()
+		<-finished
+	}()
 	lockResult := make(chan struct {
 		unlock *Lease[Data]
 		data   *Data
 		err    error
 	}, 1)
 	go func() {
+		defer close(finished)
 		delayedCtx := context.WithValue(contenderCtx, delayAcquireContextKey{}, true)
 		unlock, data, err := Lock[Data](delayedCtx, delayedClient, &LockInput{
 			Table:             table,
@@ -386,6 +387,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 			HeartbeatMaxAge:   30 * time.Second,
 			HeartbeatInterval: 15 * time.Second,
 		})
+		cleanupLease(t, unlock)
 		lockResult <- struct {
 			unlock *Lease[Data]
 			data   *Data
@@ -405,6 +407,7 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 		HeartbeatMaxAge:   2 * time.Minute,
 		HeartbeatInterval: time.Minute,
 	})
+	cleanupLease(t, otherUnlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,17 +467,8 @@ func (c lockAcquireDelayClient) Do(req *http.Request) (*http.Response, error) {
 }
 
 func TestData(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	id := Uid() // new id means empty data
 	unlock, data, err := Lock[testData](ctx, client, &LockInput{
 		Table:             table,
@@ -482,6 +476,7 @@ func TestData(t *testing.T) {
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,6 +493,7 @@ func TestData(t *testing.T) {
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,6 +521,7 @@ func TestData(t *testing.T) {
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,19 +537,11 @@ func TestData(t *testing.T) {
 }
 
 func TestLockRequireExisting(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	if err := waitForTable(ctx, client, table); err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 
 	id := "require-existing"
-	_, _, err = Lock[Data](ctx, client, &LockInput{
+	missing, _, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
 		RequireExisting:   true,
@@ -561,6 +550,7 @@ func TestLockRequireExisting(t *testing.T) {
 		Retries:           2,
 		RetriesSleep:      time.Nanosecond,
 	})
+	cleanupLease(t, missing)
 	if !errors.Is(err, ErrLockNotFound) {
 		t.Fatalf("expected ErrLockNotFound, got: %v", err)
 	}
@@ -584,6 +574,7 @@ func TestLockRequireExisting(t *testing.T) {
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,6 +592,7 @@ func TestLockRequireExisting(t *testing.T) {
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,13 +600,14 @@ func TestLockRequireExisting(t *testing.T) {
 		t.Fatalf("required acquisition returned wrong existing data: %#v", data)
 	}
 
-	_, _, err = Lock[Data](ctx, client, &LockInput{
+	contender, _, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
 		RequireExisting:   true,
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
 	})
+	cleanupLease(t, contender)
 	if !errors.Is(err, ErrLockHeld) {
 		t.Fatalf("expected held item to match ErrLockHeld, got: %v", err)
 	}
@@ -635,30 +628,21 @@ type preExistingData struct {
 }
 
 func TestPreExistingData(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	item, err := MarshalItem("test-id", preExistingData{
 		ID:    "test-id",
 		Value: "test-value",
 	})
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(table),
 		Item:      item,
 	})
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	id := "test-id"
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
@@ -667,6 +651,7 @@ func TestPreExistingData(t *testing.T) {
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,12 +660,13 @@ func TestPreExistingData(t *testing.T) {
 	} else if data.Value != "test-value" {
 		t.Fatal("wrong value")
 	}
-	_, _, err = Lock[Data](ctx, client, &LockInput{
+	contender, _, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, contender)
 	if !errors.Is(err, ErrLockHeld) {
 		t.Fatalf("contending acquisition = %v, want ErrLockHeld", err)
 	}
@@ -695,17 +681,8 @@ func TestPreExistingData(t *testing.T) {
 }
 
 func TestWriteWithoutUnlocking(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	id := "test-id"
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
@@ -713,6 +690,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -723,11 +701,11 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	err = unlock.Update(ctx, data)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	read, err := Read[Data](ctx, client, table, id)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	if read == nil {
 		t.Fatal("read is nil")
@@ -738,11 +716,11 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	err = unlock.Update(ctx, data)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	read, err = Read[Data](ctx, client, table, id)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	if read == nil {
 		t.Fatal("read is nil")
@@ -753,7 +731,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	err = unlock.Update(ctx, data)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	err = unlock.Commit(ctx, data)
 	if err != nil {
@@ -761,7 +739,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	}
 	read, err = Read[Data](ctx, client, table, id)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	if read == nil {
 		t.Fatal("read is nil")
@@ -770,7 +748,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	}
 	read, err = Read[Data](ctx, client, table, "404")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	if read != nil {
 		t.Fatal("data should be empty")
@@ -778,17 +756,8 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 }
 
 func TestUnlockTwiceFails(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
@@ -796,6 +765,7 @@ func TestUnlockTwiceFails(t *testing.T) {
 		HeartbeatMaxAge:   10 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -813,18 +783,9 @@ func TestUnlockTwiceFails(t *testing.T) {
 }
 
 func TestContextCancelBeforeLock(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(context.Background(), client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client, table := liveTable(t)
 	id := Uid()
 	unlock, _, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
@@ -832,8 +793,8 @@ func TestContextCancelBeforeLock(t *testing.T) {
 		HeartbeatMaxAge:   2 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
+	cleanupLease(t, unlock)
 	if err == nil {
-		_ = unlock.Release(context.Background())
 		t.Fatal("expected error when context is already canceled")
 	}
 }
@@ -841,16 +802,7 @@ func TestContextCancelBeforeLock(t *testing.T) {
 func TestContextCancelExpired(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { teardown(client, table) })
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client, table := liveTable(t)
 	id := Uid()
 	firstCtx, cancelFirst := context.WithCancel(ctx)
 	defer cancelFirst()
@@ -860,10 +812,10 @@ func TestContextCancelExpired(t *testing.T) {
 		HeartbeatMaxAge:   3 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
+	cleanupLease(t, first)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cleanupLease(t, first)
 	if err := first.Update(first.Context(), &Data{Value: "original"}); err != nil {
 		t.Fatal(err)
 	}
@@ -876,10 +828,10 @@ func TestContextCancelExpired(t *testing.T) {
 		HeartbeatMaxAge:   3 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
+	cleanupLease(t, second)
 	if err != nil {
 		t.Fatalf("context was canceled, lock should have expired: %v", err)
 	}
-	cleanupLease(t, second)
 	if data == nil || data.Value != "original" {
 		t.Fatalf("takeover changed the stored payload: %#v", data)
 	}
@@ -909,17 +861,8 @@ func TestContextCancelExpired(t *testing.T) {
 }
 
 func TestCommitEmptyData(t *testing.T) {
-	ctx := context.Background()
-	table := "test-go-dynamolock-" + Uid()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
@@ -927,6 +870,7 @@ func TestCommitEmptyData(t *testing.T) {
 		HeartbeatMaxAge:   10 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -950,17 +894,8 @@ func TestCommitEmptyData(t *testing.T) {
 }
 
 func TestUpdateEmptyData(t *testing.T) {
-	ctx := context.Background()
-	table := "test-go-dynamolock-" + Uid()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
@@ -968,6 +903,7 @@ func TestUpdateEmptyData(t *testing.T) {
 		HeartbeatMaxAge:   10 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
+	cleanupLease(t, unlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -995,27 +931,20 @@ func TestUpdateEmptyData(t *testing.T) {
 }
 
 func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
-	ctx := context.Background()
-	table := getTableName()
-	client, err := setup(t, table)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer teardown(client, table)
-	err = waitForTable(ctx, client, table)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ctx := t.Context()
+	client, table := liveTable(t)
 	id := Uid()
 
 	// First acquire lock with short expiration
 	cancelCtx, cancel := context.WithCancel(ctx)
-	_, _, err = Lock[Data](cancelCtx, client, &LockInput{
+	defer cancel()
+	first, _, err := Lock[Data](cancelCtx, client, &LockInput{
 		Table:             table,
 		ID:                id,
 		HeartbeatMaxAge:   3 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
+	cleanupLease(t, first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1030,50 +959,13 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 		Retries:           10,
 		RetriesSleep:      500 * time.Millisecond,
 	})
+	cleanupLease(t, unlock2)
 	if err != nil {
 		t.Fatalf("expected lock acquisition to succeed after expiration, got: %v", err)
 	}
-	_ = unlock2.Release(ctx)
-}
-
-func leaseAWSTable(t *testing.T) (*dynamodb.Client, string) {
-	t.Helper()
-	client := liveClient(t) // Verifies the account before any mutation.
-	table := "test-go-dynamolock-" + Uid()
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-	defer cancel()
-	created := false
-	t.Cleanup(func() {
-		if !created {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		if _, err := client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(table)}); err != nil {
-			t.Errorf("delete lease test table %s: %v", table, err)
-			return
-		}
-		if err := dynamodb.NewTableNotExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)}, time.Minute, func(o *dynamodb.TableNotExistsWaiterOptions) {
-			o.MinDelay, o.MaxDelay = time.Second, 3*time.Second
-		}); err != nil {
-			t.Errorf("wait for lease test table deletion %s: %v", table, err)
-		}
-	})
-	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName: aws.String(table), BillingMode: types.BillingModePayPerRequest,
-		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS}},
-		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash}},
-	})
-	if err != nil {
-		t.Fatalf("create lease test table %s: %v", table, err)
-	}
-	created = true
-	if err := dynamodb.NewTableExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)}, time.Minute, func(o *dynamodb.TableExistsWaiterOptions) {
-		o.MinDelay, o.MaxDelay = time.Second, 3*time.Second
-	}); err != nil {
+	if err := unlock2.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	return client, table
 }
 
 func liveInput(table string) *LockInput {
@@ -1122,7 +1014,7 @@ func loseAWSResponse(t *testing.T, client *dynamodb.Client, match func(wireReque
 }
 
 func TestLeaseAWS(t *testing.T) {
-	client, table := leaseAWSTable(t)
+	client, table := liveTable(t)
 	t.Run("release preserves raw payload and identity", func(t *testing.T) {
 		in := liveInput(table)
 		item, err := MarshalItem(in.ID, keyedData{Value: "retained"})

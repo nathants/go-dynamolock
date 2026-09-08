@@ -164,3 +164,8 @@ not a replacement DynamoDB implementation.
 Live tests require `DYNAMOLOCK_TEST_ACCOUNT` to match STS before mutation. Run
 `go test -race -run '^TestLeaseAWS$' -count=1 -timeout=5m` for real conditions,
 identity/payload preservation, renewal, and deliberately lost write responses.
+
+By default, each live test creates and deletes its own table. `REUSE=1` instead
+uses the dedicated `go-dynamolock` test table, **clearing all its items before and
+after each test**. Do not store application data there or run reusable-table
+suites concurrently.
