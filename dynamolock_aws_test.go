@@ -1095,7 +1095,6 @@ func TestLeaseAWS(t *testing.T) {
 	})
 	t.Run("holder expiry and stale handle", func(t *testing.T) {
 		in := liveInput(table)
-		in.HeartbeatMaxAge, in.HeartbeatInterval = 350*time.Millisecond, 200*time.Millisecond
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		first, _, err := Lock[keyedData](ctx, client, in)
@@ -1105,9 +1104,13 @@ func TestLeaseAWS(t *testing.T) {
 		cleanupLease(t, first)
 		cancel()
 		await(t, first.done)
-		time.Sleep(400 * time.Millisecond)
-		in.HeartbeatMaxAge, in.HeartbeatInterval = 2*time.Second, time.Second
-		second, _, err := Lock[keyedData](t.Context(), client, in)
+		// Allow real AWS request latency, while requiring takeover well before
+		// the contender's longer lease duration could have elapsed.
+		in.HeartbeatMaxAge, in.HeartbeatInterval = 30*time.Second, time.Second
+		in.Retries, in.RetriesSleep = 50, 100*time.Millisecond
+		takeoverCtx, cancelTakeover := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancelTakeover()
+		second, _, err := Lock[keyedData](takeoverCtx, client, in)
 		if err != nil {
 			t.Fatal(err)
 		}
