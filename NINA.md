@@ -85,3 +85,9 @@ data there or run reusable-table suites concurrently.
 Capture cleanup policy at setup and register cleanup before creation can fail.
 Cancellation, worker joins, and lease cleanup must precede table cleanup.
 Cleanup uses bounded contexts and reports failures, including after partial setup.
+After an ambiguous CreateTable, a missing DescribeTable result does not prove
+absence: reconcile pending creation within the cleanup deadline.
+
+Stale-owner payload tests must deliver an already-submitted write after takeover
+and inspect DynamoDB's conditional failure. Local cancellation alone does not
+exercise the server-side ownership condition.

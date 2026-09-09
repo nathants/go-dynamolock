@@ -72,14 +72,14 @@ func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool)
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	cleanup := false
+	cleanup, creationPending := false, false
 	t.Cleanup(func() {
 		if !cleanup {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
-		if err := cleanupTable(ctx, client, table, reuse); err != nil {
+		if err := cleanupTable(ctx, client, table, reuse, creationPending); err != nil {
 			t.Errorf("cleanup test table %s: %v", table, err)
 		}
 	})
@@ -94,13 +94,12 @@ func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool)
 	case errors.As(err, &absent):
 		// Record responsibility before creation, including a lost response.
 		// Never delete an independently pre-existing disposable table.
-		cleanup = true
+		cleanup, creationPending = true, true
 		_, err := client.CreateTable(ctx, input, noSDKRetry)
 		if err != nil {
-			var collision *types.ResourceInUseException
-			if errors.As(err, &collision) {
-				cleanup = false // Another creator won; this request did not create it.
-			}
+			// A definitive rejection, including another creator winning, did
+			// not create a table that this fixture is responsible for.
+			cleanup = !definitelyRejected(err)
 			t.Fatalf("create test table %s: %v", table, err)
 		}
 	case err != nil:
@@ -112,9 +111,10 @@ func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool)
 	default:
 		cleanup = true
 	}
-	if err := waitForTable(ctx, client, table); err != nil {
+	if _, err := waitForTable(ctx, client, table); err != nil {
 		t.Fatalf("wait for test table %s: %v", table, err)
 	}
+	creationPending = false
 	if reuse {
 		if err := ClearTable(ctx, client, table); err != nil {
 			t.Fatalf("clear test table %s: %v", table, err)
@@ -122,9 +122,17 @@ func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool)
 	}
 }
 
-func cleanupTable(ctx context.Context, client *dynamodb.Client, table string, reuse bool) error {
+func cleanupTable(ctx context.Context, client *dynamodb.Client, table string, reuse, creationPending bool) error {
 	out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
 	var absent *types.ResourceNotFoundException
+	if creationPending && errors.As(err, &absent) {
+		// DescribeTable is eventually consistent after CreateTable. A missing
+		// description cannot prove cleanup is complete while creation is pending.
+		out, err = waitForTable(ctx, client, table)
+		if err != nil {
+			return fmt.Errorf("confirm pending table creation: %w", err)
+		}
+	}
 	if errors.As(err, &absent) {
 		return nil
 	}
@@ -135,8 +143,10 @@ func cleanupTable(ctx context.Context, client *dynamodb.Client, table string, re
 		return fmt.Errorf("missing table description")
 	}
 	if out.Table.TableStatus != types.TableStatusDeleting {
-		if err := waitForTable(ctx, client, table); err != nil {
-			return err
+		if out.Table.TableStatus != types.TableStatusActive {
+			if _, err := waitForTable(ctx, client, table); err != nil {
+				return err
+			}
 		}
 		if reuse {
 			return ClearTable(ctx, client, table)
@@ -224,8 +234,8 @@ func Uid() string {
 	return cryptorand.Text()
 }
 
-func waitForTable(ctx context.Context, client *dynamodb.Client, table string) error {
-	return dynamodb.NewTableExistsWaiter(client).Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)}, 2*time.Minute, func(o *dynamodb.TableExistsWaiterOptions) {
+func waitForTable(ctx context.Context, client *dynamodb.Client, table string) (*dynamodb.DescribeTableOutput, error) {
+	return dynamodb.NewTableExistsWaiter(client).WaitForOutput(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)}, 2*time.Minute, func(o *dynamodb.TableExistsWaiterOptions) {
 		o.MinDelay, o.MaxDelay = time.Second, 3*time.Second
 	})
 }
@@ -972,6 +982,21 @@ func liveInput(table string) *LockInput {
 	return &LockInput{Table: table, ID: Uid(), HeartbeatMaxAge: 2 * time.Second, HeartbeatInterval: 200 * time.Millisecond}
 }
 
+// Inspect a request for fault injection without consuming the body sent to AWS.
+func readAWSRequest(req *http.Request) (wireRequest, error) {
+	var w wireRequest
+	body, readErr := io.ReadAll(req.Body)
+	if err := errors.Join(readErr, req.Body.Close()); err != nil {
+		return w, err
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	if err := json.Unmarshal(body, &w); err != nil {
+		return w, err
+	}
+	w.Target = req.Header.Get("X-Amz-Target")
+	return w, nil
+}
+
 // loseAWSResponse lets DynamoDB apply one matching request, then substitutes an
 // error for the successful response. Failing before the write would not exercise
 // reconciliation of an ambiguous result.
@@ -981,19 +1006,10 @@ func loseAWSResponse(t *testing.T, client *dynamodb.Client, match func(wireReque
 	base := client.Options().HTTPClient
 	return dynamodb.New(client.Options(), func(o *dynamodb.Options) {
 		o.HTTPClient = httpFunc(func(req *http.Request) (*http.Response, error) {
-			body, err := io.ReadAll(req.Body)
+			w, err := readAWSRequest(req)
 			if err != nil {
 				return nil, err
 			}
-			if err := req.Body.Close(); err != nil {
-				return nil, err
-			}
-			req.Body = io.NopCloser(bytes.NewReader(body))
-			var w wireRequest
-			if err := json.Unmarshal(body, &w); err != nil {
-				return nil, err
-			}
-			w.Target = req.Header.Get("X-Amz-Target")
 			resp, err := base.Do(req)
 			if err != nil || resp.StatusCode != http.StatusOK || !match(w) || !injected.CompareAndSwap(0, 1) {
 				return resp, err
@@ -1110,6 +1126,123 @@ func TestLeaseAWS(t *testing.T) {
 			t.Fatalf("stale cleanup disturbed successor: %#v %v", read, err)
 		}
 	})
+	for _, operation := range []string{"update", "commit"} {
+		t.Run("delayed stale "+operation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			firstCtx, cancelFirst := context.WithCancel(ctx)
+			entered, resumeRequest := make(chan struct{}), make(chan struct{})
+			resume := sync.OnceFunc(func() { close(resumeRequest) })
+			var workers sync.WaitGroup
+			defer func() {
+				cancelFirst()
+				cancel()
+				resume()
+				workers.Wait()
+			}()
+
+			var payloadCalls, responseStatus int
+			var response struct {
+				Type string `json:"__type"`
+			}
+			base := client.Options().HTTPClient
+			delayed := dynamodb.New(client.Options(), func(o *dynamodb.Options) {
+				o.HTTPClient = httpFunc(func(req *http.Request) (*http.Response, error) {
+					w, err := readAWSRequest(req)
+					if err != nil {
+						return nil, err
+					}
+					if w.ExpressionAttributeValues[":data"] == nil {
+						return base.Do(req)
+					}
+					payloadCalls++
+					if payloadCalls != 1 {
+						return nil, errors.New("stale payload request was retried")
+					}
+					close(entered)
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-resumeRequest:
+					}
+					// Model a request accepted before cancellation but processed
+					// after takeover. A separate bounded context lets DynamoDB,
+					// rather than client cancellation, decide this write's fate.
+					resp, err := base.Do(req.Clone(ctx))
+					if err != nil {
+						return nil, err
+					}
+					responseStatus = resp.StatusCode
+					body, readErr := io.ReadAll(resp.Body)
+					if err := errors.Join(readErr, resp.Body.Close()); err != nil {
+						return nil, err
+					}
+					resp.Body = io.NopCloser(bytes.NewReader(body))
+					if err := json.Unmarshal(body, &response); err != nil {
+						return nil, err
+					}
+					return resp, nil
+				})
+			})
+			in := liveInput(table)
+			first, _, err := Lock[keyedData](firstCtx, delayed, in)
+			cleanupLease(t, first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			write := first.Update
+			if operation == "commit" {
+				write = first.Commit
+			}
+			result := make(chan error, 1)
+			workers.Go(func() { result <- write(first.Context(), &keyedData{Value: "stale"}) })
+			await(t, entered)
+			cancelFirst()
+			await(t, first.done)
+
+			successorInput := *in
+			successorInput.HeartbeatMaxAge, successorInput.HeartbeatInterval = 10*time.Second, time.Second
+			successorInput.RequireExisting, successorInput.Retries, successorInput.RetriesSleep = true, 50, 100*time.Millisecond
+			second, _, err := Lock[keyedData](ctx, client, &successorInput)
+			cleanupLease(t, second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := second.Update(ctx, &keyedData{Value: "successor"}); err != nil {
+				t.Fatal(err)
+			}
+			before, err := getItem(ctx, client, table, in.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := parseRecord(before)
+			if err != nil || r.owner != second.owner || r.data == nil {
+				t.Fatalf("successor did not establish ownership and payload: %v", err)
+			}
+
+			resume()
+			var writeErr error
+			select {
+			case writeErr = <-result:
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for the stale write response")
+			}
+			// A canceled SDK call alone proves nothing: inspect the real service
+			// response even if cancellation masks it in the caller's error.
+			if payloadCalls != 1 || responseStatus != http.StatusBadRequest || !strings.HasSuffix(response.Type, "ConditionalCheckFailedException") {
+				t.Fatalf("DynamoDB did not fence stale %s: requests=%d status=%d type=%q", operation, payloadCalls, responseStatus, response.Type)
+			}
+			if !errors.Is(writeErr, ErrLeaseLost) && !errors.Is(writeErr, ErrOutcomeUnknown) {
+				t.Fatalf("stale in-flight %s result: %v", operation, writeErr)
+			}
+			after, err := getItem(ctx, client, table, in.ID)
+			if err != nil || !reflect.DeepEqual(after["data"], before["data"]) || !reflect.DeepEqual(after["owner_token"], before["owner_token"]) {
+				t.Fatalf("stale %s changed successor payload or ownership: %v", operation, err)
+			}
+			if err := second.Commit(ctx, &keyedData{Value: "committed"}); err != nil {
+				t.Fatalf("successor could not commit after stale %s: %v", operation, err)
+			}
+		})
+	}
 	t.Run("renewal after ambiguous applied heartbeat", func(t *testing.T) {
 		in := liveInput(table)
 		faulty, injected := loseAWSResponse(t, client, func(w wireRequest) bool { return w.ExpressionAttributeValues[":next"] != nil })

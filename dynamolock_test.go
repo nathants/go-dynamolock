@@ -166,6 +166,9 @@ func TestLiveFixtureLifecycle(t *testing.T) {
 		{name: "disposable", deletes: 1},
 		{name: "changed_reuse", deletes: 1},
 		{name: "lost_create_response", wantFail: true, deletes: 1},
+		{name: "lost_create_invisible", wantFail: true, deletes: 1},
+		{name: "reused_lost_create_invisible", reuse: true, wantFail: true, scans: 1},
+		{name: "rejected_create", wantFail: true},
 		{name: "failed_wait", wantFail: true, deletes: 1},
 		{name: "delete_error", wantFail: true, deletes: 1},
 		{name: "delete_wait_error", wantFail: true, deletes: 1},
@@ -180,6 +183,7 @@ func TestLiveFixtureLifecycle(t *testing.T) {
 		{name: "wrong_schema", reuse: true, exists: true, wantFail: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			invisibleCreate := tc.name == "lost_create_invisible" || tc.name == "reused_lost_create_invisible"
 			var exists atomic.Bool
 			exists.Store(tc.exists)
 			var descriptions, deletes, scans, releases atomic.Int32
@@ -202,9 +206,13 @@ func TestLiveFixtureLifecycle(t *testing.T) {
 				w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 				switch r.Header.Get("X-Amz-Target") {
 				case "DynamoDB_20120810.CreateTable":
+					if tc.name == "rejected_create" {
+						reply(400, rejectedJSON)
+						return
+					}
 					if exists.Swap(true) || tc.name == "racing_create" {
 						reply(400, `{"__type":"ResourceInUseException"}`)
-					} else if tc.name == "lost_create_response" {
+					} else if tc.name == "lost_create_response" || invisibleCreate {
 						reply(500, serverErrorJSON)
 					} else {
 						reply(200, `{}`)
@@ -214,7 +222,8 @@ func TestLiveFixtureLifecycle(t *testing.T) {
 						reply(400, rejectedJSON)
 						return
 					}
-					if !exists.Load() {
+					// DescribeTable can temporarily hide an applied CreateTable.
+					if invisibleCreate && descriptions.Load() == 2 || !exists.Load() {
 						reply(400, `{"__type":"ResourceNotFoundException"}`)
 						return
 					}
@@ -287,7 +296,30 @@ func TestLiveFixtureLifecycle(t *testing.T) {
 			if tc.name == "delete_error" && !strings.Contains(string(output), "delete denied") {
 				t.Fatalf("cleanup error was not reported: %s", output)
 			}
+			if tc.name == "rejected_create" && descriptions.Load() != 1 {
+				t.Fatalf("definitively rejected creation attempted cleanup: descriptions=%d\n%s", descriptions.Load(), output)
+			}
 		})
+	}
+}
+
+func TestCleanupPendingCreateHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var descriptions int
+	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+		if w.Target != "DynamoDB_20120810.DescribeTable" {
+			t.Errorf("unconfirmed creation reached cleanup mutation: %s", w.Target)
+			return 400, rejectedJSON, nil
+		}
+		descriptions++
+		if descriptions == 2 {
+			cancel()
+		}
+		return 400, `{"__type":"ResourceNotFoundException"}`, nil
+	})
+	if err := cleanupTable(ctx, client, "table", false, true); !errors.Is(err, context.Canceled) || descriptions != 2 {
+		t.Fatalf("pending creation was silently abandoned or ignored cancellation: descriptions=%d err=%v", descriptions, err)
 	}
 }
 
@@ -1017,6 +1049,53 @@ func TestProtocolCanceledLeaseAllowsOnlyRelease(t *testing.T) {
 	}
 	if err := l.Release(t.Context()); err != nil || writes != 1 {
 		t.Fatalf("fresh cleanup failed: %d %v", writes, err)
+	}
+}
+
+func TestProtocolPayloadConditionFailureLosesLease(t *testing.T) {
+	for _, commit := range []bool{false, true} {
+		t.Run(fmt.Sprint(commit), func(t *testing.T) {
+			var acquisition, payload wireRequest
+			var writes int
+			client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+				if w.ReturnValues == "ALL_NEW" {
+					acquisition = w
+					return acquireReply(w, "")
+				}
+				if w.ExpressionAttributeValues[":data"] != nil {
+					payload = w
+					writes++
+					return 400, conditionalJSON, nil
+				}
+				return 200, `{}`, nil
+			})
+			l, _, err := Lock[keyedData](t.Context(), client, protocolInput())
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleanupLease(t, l)
+			write, update := l.Update, "SET #data = :data"
+			if commit {
+				write, update = l.Commit, update+" REMOVE #owner, #expires"
+			}
+			before := time.Now()
+			err = write(t.Context(), &keyedData{Value: "stale"})
+			after := time.Now()
+			if _, conditional := conditionalFailure(err); !conditional || !errors.Is(err, ErrLeaseLost) || !errors.Is(context.Cause(l.Context()), ErrLeaseLost) {
+				t.Fatalf("conditional payload failure did not lose the lease: %v", err)
+			}
+			if payload.ConditionExpression != "#owner = :owner AND #expires > :now" || payload.UpdateExpression != update ||
+				!reflect.DeepEqual(payload.ExpressionAttributeNames, map[string]string{"#owner": "owner_token", "#expires": "expires_at", "#data": "data"}) ||
+				string(payload.ExpressionAttributeValues[":owner"]) != string(acquisition.ExpressionAttributeValues[":owner"]) {
+				t.Fatalf("payload fencing mismatch: condition=%q update=%q names=%v owner=%s", payload.ConditionExpression, payload.UpdateExpression, payload.ExpressionAttributeNames, payload.ExpressionAttributeValues[":owner"])
+			}
+			if now := wireInt(payload, ":now"); now < before.UnixNano() || now > after.UnixNano() {
+				t.Fatalf("payload condition used a stale timestamp: %d", now)
+			}
+			if !errors.Is(l.Update(t.Context(), &keyedData{}), ErrLeaseLost) || !errors.Is(l.Commit(t.Context(), &keyedData{}), ErrLeaseLost) || writes != 1 {
+				t.Fatalf("lost lease retried or issued another payload write: %d", writes)
+			}
+		})
 	}
 }
 
