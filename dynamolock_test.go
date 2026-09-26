@@ -2,13 +2,17 @@ package dynamolock
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"reflect"
@@ -16,7 +20,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -466,9 +472,14 @@ func wireInt(w wireRequest, name string) int64 {
 
 func await(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
+	awaitWithin(t, ch, 3*time.Second)
+}
+
+func awaitWithin(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
+	t.Helper()
 	select {
 	case <-ch:
-	case <-time.After(3 * time.Second):
+	case <-time.After(timeout):
 		t.Fatal("timed out waiting for test synchronization")
 	}
 }
@@ -481,7 +492,8 @@ func cleanupLease[T any](t *testing.T, l *Lease[T]) {
 		return
 	}
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		// Leave live releases time for a slow new connection.
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if err := l.Release(ctx); err != nil {
 			t.Errorf("release test lease: %v", err)
@@ -814,9 +826,11 @@ func TestProtocolSlowPayloadCannotOverwriteHeartbeat(t *testing.T) {
 func TestProtocolHeartbeatRetriesUseFreshTimestamps(t *testing.T) {
 	var timestamps []int64
 	var deadlines []time.Time
+	var acquired int64
 	renewed := make(chan struct{})
 	client := protocolClient(func(ctx context.Context, w wireRequest) (int, any, error) {
 		if w.ReturnValues == "ALL_NEW" {
+			acquired = wireInt(w, ":expires")
 			return acquireReply(w, "")
 		}
 		if w.ExpressionAttributeValues[":next"] == nil {
@@ -847,7 +861,8 @@ func TestProtocolHeartbeatRetriesUseFreshTimestamps(t *testing.T) {
 	if err := l.Release(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if len(timestamps) != 2 || timestamps[1] <= timestamps[0] || !deadlines[0].Equal(deadlines[1]) {
+	// Per-attempt timeouts may shorten, but never extend, the confirmed budget.
+	if len(timestamps) != 2 || timestamps[1] <= timestamps[0] || deadlines[0].UnixNano() > acquired || deadlines[1].UnixNano() > acquired {
 		t.Fatalf("stale timestamps or unconfirmed lease extension: %v %v", timestamps, deadlines)
 	}
 }
@@ -1334,6 +1349,240 @@ func TestEnvelopeIdentityCannotBeShadowedByCaseAlias(t *testing.T) {
 			if _, err := UnmarshalItem[keyedData](item); !errors.Is(err, ErrInvalidRecord) {
 				t.Fatalf("stored alias could override the injected identity: %v", err)
 			}
+		})
+	}
+}
+
+func TestBackoffSaturatesBeforeShiftOverflow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, attempt := range []int{0, 4, 37, 63, 64, math.MaxInt} {
+			minimum, maximum := 500*time.Millisecond, time.Second
+			if attempt == 0 {
+				minimum, maximum = 50*time.Millisecond, 100*time.Millisecond
+			}
+			start := time.Now()
+			if err := backoff(t.Context(), attempt); err != nil {
+				t.Fatal(err)
+			}
+			if elapsed := time.Since(start); elapsed < minimum || elapsed > maximum {
+				t.Fatalf("attempt %d waited %v", attempt, elapsed)
+			}
+		}
+	})
+}
+
+// sendFailure mimics the error chain Go's HTTP transport returns without a response.
+func sendFailure(err error) func(context.Context) (int, any, error) {
+	return func(context.Context) (int, any, error) {
+		return 0, nil, &url.Error{Op: "Post", URL: "https://dynamodb.us-east-1.amazonaws.com/", Err: err}
+	}
+}
+
+// synctest's fake clock lets sustained failures span a realistic 60s lease.
+func TestProtocolRenewalRetriesUntilConfirmedDeadline(t *testing.T) {
+	serverError := func(context.Context) (int, any, error) { return 500, serverErrorJSON, nil }
+	nxdomain := sendFailure(&net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{
+		Err: "no such host", Name: "dynamodb.us-east-1.amazonaws.com", IsNotFound: true,
+	}})
+	stuck := func(ctx context.Context) (int, any, error) { <-ctx.Done(); return 0, nil, ctx.Err() }
+	denied := func(context.Context) (int, any, error) {
+		return 400, `{"__type":"com.amazon.coral.service#AccessDeniedException","message":"not authorized"}`, nil
+	}
+	rejected := func(context.Context) (int, any, error) { return 400, rejectedJSON, nil }
+	for _, tc := range []struct {
+		name     string
+		fail     func(context.Context) (int, any, error)
+		failures int32  // Failed renewals before success; negative never succeeds.
+		cause    string // Expected loss cause; empty expects the lease to survive.
+		fatal    bool   // The first failure must end the lease without a retry.
+	}{
+		{name: "server errors beyond backoff saturation", fail: serverError, failures: 45},
+		{name: "nxdomain on the acquisition endpoint", fail: nxdomain, failures: 8},
+		{name: "connection reset", fail: sendFailure(&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}), failures: 3},
+		{name: "connection closed without response", fail: sendFailure(io.EOF), failures: 3},
+		{name: "attempt timeout then success", fail: stuck, failures: 1},
+		{name: "sustained server errors", fail: serverError, failures: -1, cause: "response lost"},
+		{name: "sustained nxdomain", fail: nxdomain, failures: -1, cause: "no such host"},
+		{name: "sustained attempt timeouts", fail: stuck, failures: -1, cause: "renewal attempt timed out after 30s"},
+		{name: "access denied", fail: denied, failures: -1, cause: "AccessDeniedException", fatal: true},
+		{name: "validation", fail: rejected, failures: -1, cause: "ValidationException", fatal: true},
+		{name: "tls trust", fail: sendFailure(x509.UnknownAuthorityError{}), failures: -1, cause: "certificate signed by unknown authority", fatal: true},
+		{name: "endpoint configuration", fail: sendFailure(errors.New(`unsupported protocol scheme ""`)), failures: -1, cause: "unsupported protocol scheme", fatal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var mu sync.Mutex
+				var acquired int64
+				var attempts int32
+				var timeouts []time.Duration
+				client := protocolClient(func(ctx context.Context, w wireRequest) (int, any, error) {
+					if w.ReturnValues == "ALL_NEW" {
+						acquired = wireInt(w, ":expires")
+						return acquireReply(w, "")
+					}
+					if w.ExpressionAttributeValues[":next"] == nil {
+						return 200, `{}`, nil
+					}
+					mu.Lock()
+					attempts++
+					failing := tc.failures < 0 || attempts <= tc.failures
+					deadline, ok := ctx.Deadline()
+					if failing && (!ok || deadline.UnixNano() > acquired) {
+						mu.Unlock()
+						return 0, nil, errors.New("unconfirmed renewal extended the lease budget")
+					}
+					timeouts = append(timeouts, time.Until(deadline))
+					mu.Unlock()
+					if failing {
+						return tc.fail(ctx)
+					}
+					return 200, `{}`, nil
+				})
+				in := protocolInput()
+				in.HeartbeatMaxAge, in.HeartbeatInterval = time.Minute, 5*time.Second
+				start := time.Now()
+				l, _, err := Lock[keyedData](t.Context(), client, in)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cleanupLease(t, l)
+				if tc.cause == "" {
+					// Only a renewal confirmed after the failures can outlive the
+					// acquisition's deadline.
+					time.Sleep(2 * in.HeartbeatMaxAge)
+					if err := context.Cause(l.Context()); err != nil {
+						t.Fatalf("transient failures lost the lease: %v", err)
+					}
+				} else {
+					<-l.Context().Done()
+					cause := context.Cause(l.Context())
+					if !errors.Is(cause, ErrLeaseLost) || !strings.Contains(cause.Error(), tc.cause) {
+						t.Fatalf("loss lacks underlying cause %q: %v", tc.cause, cause)
+					}
+					if elapsed := time.Since(start); !tc.fatal && elapsed != in.HeartbeatMaxAge {
+						t.Fatalf("retries ended after %v, not at the confirmed deadline", elapsed)
+					}
+				}
+				if err := l.Release(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case tc.fatal && attempts != 1:
+					t.Fatalf("permanent failure was retried: %d attempts", attempts)
+				case !tc.fatal && tc.failures < 0 && attempts < 2:
+					t.Fatalf("sustained failure was not retried: %d attempts", attempts)
+				case tc.failures > 0 && attempts <= tc.failures:
+					t.Fatalf("no renewal succeeded: %d attempts", attempts)
+				}
+				for _, timeout := range timeouts {
+					if timeout > in.HeartbeatMaxAge/2 {
+						t.Fatalf("renewal attempt timeout exceeded half the lease: %v", timeouts)
+					}
+				}
+			})
+		})
+	}
+}
+
+// A slow but steady network must keep a lease whose budget covers each
+// response: 600ms renewals fit a 2s lease renewed every 200ms.
+func TestProtocolSlowRenewalResponsesKeepLease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var renewals atomic.Int32
+		client := protocolClient(func(ctx context.Context, w wireRequest) (int, any, error) {
+			if w.ReturnValues == "ALL_NEW" {
+				return acquireReply(w, "")
+			}
+			if w.ExpressionAttributeValues[":next"] == nil {
+				return 200, `{}`, nil
+			}
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-time.After(600 * time.Millisecond):
+			}
+			renewals.Add(1)
+			return 200, `{}`, nil
+		})
+		in := protocolInput()
+		in.HeartbeatMaxAge, in.HeartbeatInterval = 2*time.Second, 200*time.Millisecond
+		l, _, err := Lock[keyedData](t.Context(), client, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cleanupLease(t, l)
+		time.Sleep(10 * in.HeartbeatMaxAge)
+		if err := context.Cause(l.Context()); err != nil || renewals.Load() < 10 {
+			t.Fatalf("slow renewals lost the lease after %d confirmations: %v", renewals.Load(), err)
+		}
+		if err := l.Release(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestProtocolRenewalRetryStopsOnCancellationAndCompletion(t *testing.T) {
+	for _, stop := range []string{"parent", "release", "commit"} {
+		t.Run(stop, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var renewals atomic.Int32
+				retrying := make(chan struct{})
+				client := protocolClient(func(ctx context.Context, w wireRequest) (int, any, error) {
+					if w.ReturnValues == "ALL_NEW" {
+						return acquireReply(w, "")
+					}
+					if w.ExpressionAttributeValues[":next"] == nil {
+						return 200, `{}`, nil
+					}
+					if renewals.Add(1) < 3 {
+						return 500, serverErrorJSON, nil
+					}
+					// Hold the third attempt until its context ends, then answer
+					// successfully: a late success must not revive the handle.
+					close(retrying)
+					<-ctx.Done()
+					return 200, `{}`, nil
+				})
+				in := protocolInput()
+				in.HeartbeatMaxAge, in.HeartbeatInterval = time.Minute, 5*time.Second
+				parent, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				l, _, err := Lock[keyedData](parent, client, in)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cleanupLease(t, l)
+				<-retrying
+				start := time.Now()
+				switch stop {
+				case "parent":
+					cancel()
+					<-l.done
+				case "release":
+					err = l.Release(t.Context())
+				case "commit":
+					err = l.Commit(t.Context(), &keyedData{Value: "committed"})
+				default:
+					t.Fatalf("unknown stop %q", stop)
+				}
+				if err != nil || time.Since(start) != 0 {
+					t.Fatalf("stop waited %v for renewal retries: %v", time.Since(start), err)
+				}
+				<-l.done
+				want := ErrReleased
+				if stop == "parent" {
+					want = context.Canceled
+				}
+				time.Sleep(2 * in.HeartbeatMaxAge)
+				if cause := context.Cause(l.Context()); !errors.Is(cause, want) || renewals.Load() != 3 {
+					t.Fatalf("renewal continued after stop: %d %v", renewals.Load(), cause)
+				}
+				if stop == "parent" && !errors.Is(l.Update(t.Context(), &keyedData{}), ErrLeaseLost) {
+					t.Fatal("late renewal success revived a canceled lease")
+				}
+			})
 		})
 	}
 }

@@ -5,10 +5,14 @@ package dynamolock
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	mathrand "math/rand/v2"
+	"net"
 	"strconv"
 	"time"
 
@@ -250,6 +254,30 @@ func retryable(err error) bool {
 	return retry.NewStandard().IsErrorRetryable(err)
 }
 
+// Renewal can resend after network failures that received no response,
+// including NXDOMAIN on the endpoint that served acquisition: its condition
+// never lowers stored expiry, and only a confirmed response extends the local
+// deadline. The SDK marks every send failure retryable, so classify them here:
+// TLS trust and request configuration errors remain fatal.
+func renewalRetryable(err error) bool {
+	var send *smithyhttp.RequestSendError
+	if !errors.As(err, &send) {
+		return retryable(err)
+	}
+	var verification *tls.CertificateVerificationError
+	var authority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	if errors.As(err, &verification) || errors.As(err, &authority) || errors.As(err, &hostname) || errors.As(err, &invalid) {
+		return false
+	}
+	var dns *net.DNSError
+	var network *net.OpError
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &dns) || errors.As(err, &network) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &timeout) && timeout.Timeout()
+}
+
 // A service rejection is different from a transport/server failure: the latter
 // may have committed. In particular, never retry an ambiguous payload write.
 func definitelyRejected(err error) bool {
@@ -279,7 +307,11 @@ func wait(ctx context.Context, duration time.Duration) error {
 }
 
 func backoff(ctx context.Context, attempt int) error {
-	ceiling := min(100*time.Millisecond<<attempt, time.Second)
+	// Saturate before shifting: renewal can retry often enough to overflow.
+	ceiling := time.Second
+	if attempt < 4 {
+		ceiling = 100 * time.Millisecond << attempt
+	}
 	return wait(ctx, ceiling/2+time.Duration(mathrand.Int64N(int64(ceiling/2))))
 }
 

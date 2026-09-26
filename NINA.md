@@ -41,10 +41,13 @@ guidance here and implementation rationale beside the relevant code.
   from renewal; do not hold that serialization gate in the heartbeat path.
 - Production uses the caller's DynamoDB SDK client, without configuration loading
   or logging dependencies. Lock copies its input.
-- SDK retries are disabled per request. Library retry loops are bounded by
-  `maxAttempts` and their contexts; configured contention retries are separate.
-  Ambiguous acquisition is reconciled by reading its token, never by resending
-  acquisition. Ambiguous payload writes are not retried.
+- SDK retries are disabled per request. Acquisition, read, payload-write, and
+  release retries are bounded by `maxAttempts` and their contexts; configured
+  contention retries are separate. Renewal retries only transient failures, each
+  attempt time-bounded, until the last confirmed monotonic deadline; permanent
+  errors, loss, release, and parent cancellation end it. Ambiguous acquisition is
+  reconciled by reading its token, never by resending acquisition. Ambiguous
+  payload writes are not retried.
 - Conditional writes protect this item, not external effects. Monotonic local
   timing does not eliminate wall-clock skew between hosts.
 

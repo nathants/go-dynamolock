@@ -115,6 +115,17 @@ follow the same lease protocol.
 with ample room for network latency and retries. If a holder stops renewing,
 another caller can acquire the item after its expiry passes.
 
+Renewal retries throttling, server errors, timeouts, and network failures,
+including DNS lookup failures, until the last confirmed expiry. Each attempt
+times out after half of `HeartbeatMaxAge`, so after a stuck request at most half
+the lease minus `HeartbeatInterval` remains for retries; backoff and delayed
+renewal starts shorten it. Keep the interval well below half the lease. A
+response slower than half the lease is abandoned even if it would have arrived
+in time. If no renewal is confirmed in time, the lease is lost; `context.Cause`
+includes the last renewal failure if an attempt failed before expiry.
+Authorization, validation, and TLS certificate errors lose the lease
+immediately.
+
 The context passed to `Lock` controls the entire lease lifetime. Use
 `lease.Context()` for protected work and stop when it is canceled; `context.Cause`
 reports the reason. Cancellation stops renewal but does not release the item.

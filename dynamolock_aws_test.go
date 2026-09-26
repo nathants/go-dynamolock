@@ -301,7 +301,7 @@ func TestReadModifyWrite(t *testing.T) {
 				lease, data, err := Lock[counter](ctx, client, &LockInput{
 					Table:             table,
 					ID:                id,
-					HeartbeatMaxAge:   time.Second * 5,
+					HeartbeatMaxAge:   liveLease,
 					HeartbeatInterval: time.Second * 1,
 					Retries:           5,
 					RetriesSleep:      1 * time.Second,
@@ -773,7 +773,7 @@ func TestUnlockTwiceFails(t *testing.T) {
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
+		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
 	cleanupLease(t, unlock)
@@ -820,7 +820,7 @@ func TestContextCancelExpired(t *testing.T) {
 	first, _, err := Lock[Data](firstCtx, client, &LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
+		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
 	cleanupLease(t, first)
@@ -832,11 +832,11 @@ func TestContextCancelExpired(t *testing.T) {
 	}
 	cancelFirst()
 	await(t, first.done)
-	time.Sleep(5 * time.Second)
+	time.Sleep(liveLease + 2*time.Second)
 	second, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
+		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
 	cleanupLease(t, second)
@@ -878,7 +878,7 @@ func TestCommitEmptyData(t *testing.T) {
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
+		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
 	cleanupLease(t, unlock)
@@ -911,7 +911,7 @@ func TestUpdateEmptyData(t *testing.T) {
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   10 * time.Second,
+		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
 	cleanupLease(t, unlock)
@@ -951,7 +951,7 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	first, _, err := Lock[Data](cancelCtx, client, &LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
+		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
 	cleanupLease(t, first)
@@ -964,10 +964,10 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	unlock2, _, err := Lock[Data](ctx, client, &LockInput{
 		Table:             table,
 		ID:                id,
-		HeartbeatMaxAge:   3 * time.Second,
+		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
-		Retries:           10,
-		RetriesSleep:      500 * time.Millisecond,
+		Retries:           100,
+		RetriesSleep:      500 * time.Millisecond, // Sleeps alone outlast the first lease.
 	})
 	cleanupLease(t, unlock2)
 	if err != nil {
@@ -978,8 +978,13 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	}
 }
 
+// Acquisition may use a whole lease and each renewal attempt half of one. Live
+// leases keep both budgets well above the several seconds a request can take
+// on a new connection to a distant region.
+const liveLease = 30 * time.Second
+
 func liveInput(table string) *LockInput {
-	return &LockInput{Table: table, ID: Uid(), HeartbeatMaxAge: 2 * time.Second, HeartbeatInterval: 200 * time.Millisecond}
+	return &LockInput{Table: table, ID: Uid(), HeartbeatMaxAge: liveLease, HeartbeatInterval: time.Second}
 }
 
 // Inspect a request for fault injection without consuming the body sent to AWS.
@@ -1072,9 +1077,9 @@ func TestLeaseAWS(t *testing.T) {
 			t.Fatalf("checkpoint not visible while held: %#v %v", read, err)
 		}
 		contender := *in
-		// Leave enough request budget for a real network round trip while
-		// still using a much shorter lease than the current holder.
-		contender.HeartbeatMaxAge, contender.HeartbeatInterval = 500*time.Millisecond, time.Millisecond
+		// Use a distinctly shorter lease than the current holder's, while
+		// leaving the acquisition request ample time for network latency.
+		contender.HeartbeatMaxAge, contender.HeartbeatInterval = 16*time.Second, time.Second
 		if other, _, err := Lock[keyedData](t.Context(), client, &contender); !errors.Is(err, ErrLockHeld) {
 			if other != nil {
 				cleanupLease(t, other)
@@ -1106,9 +1111,10 @@ func TestLeaseAWS(t *testing.T) {
 		await(t, first.done)
 		// Allow real AWS request latency, while requiring takeover well before
 		// the contender's longer lease duration could have elapsed.
-		in.HeartbeatMaxAge, in.HeartbeatInterval = 30*time.Second, time.Second
-		in.Retries, in.RetriesSleep = 50, 100*time.Millisecond
-		takeoverCtx, cancelTakeover := context.WithTimeout(t.Context(), 10*time.Second)
+		holderLease := in.HeartbeatMaxAge
+		in.HeartbeatMaxAge, in.HeartbeatInterval = 3*holderLease, time.Second
+		in.Retries, in.RetriesSleep = 100, 500*time.Millisecond
+		takeoverCtx, cancelTakeover := context.WithTimeout(t.Context(), holderLease+30*time.Second)
 		defer cancelTakeover()
 		second, _, err := Lock[keyedData](takeoverCtx, client, in)
 		if err != nil {
@@ -1131,7 +1137,9 @@ func TestLeaseAWS(t *testing.T) {
 	})
 	for _, operation := range []string{"update", "commit"} {
 		t.Run("delayed stale "+operation, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			in := liveInput(table)
+			// The successor must outlast the first lease, then finish its own writes.
+			ctx, cancel := context.WithTimeout(t.Context(), in.HeartbeatMaxAge+time.Minute)
 			firstCtx, cancelFirst := context.WithCancel(ctx)
 			entered, resumeRequest := make(chan struct{}), make(chan struct{})
 			resume := sync.OnceFunc(func() { close(resumeRequest) })
@@ -1186,7 +1194,6 @@ func TestLeaseAWS(t *testing.T) {
 					return resp, nil
 				})
 			})
-			in := liveInput(table)
 			first, _, err := Lock[keyedData](firstCtx, delayed, in)
 			cleanupLease(t, first)
 			if err != nil {
@@ -1203,8 +1210,7 @@ func TestLeaseAWS(t *testing.T) {
 			await(t, first.done)
 
 			successorInput := *in
-			successorInput.HeartbeatMaxAge, successorInput.HeartbeatInterval = 10*time.Second, time.Second
-			successorInput.RequireExisting, successorInput.Retries, successorInput.RetriesSleep = true, 50, 100*time.Millisecond
+			successorInput.RequireExisting, successorInput.Retries, successorInput.RetriesSleep = true, 100, 500*time.Millisecond
 			second, _, err := Lock[keyedData](ctx, client, &successorInput)
 			cleanupLease(t, second)
 			if err != nil {
@@ -1258,7 +1264,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(2300 * time.Millisecond)
+		time.Sleep(in.HeartbeatMaxAge + 300*time.Millisecond)
 		if l.Context().Err() != nil || injected.Load() != 1 {
 			t.Fatalf("renewal stopped: injected=%d cause=%v", injected.Load(), context.Cause(l.Context()))
 		}
@@ -1270,6 +1276,84 @@ func TestLeaseAWS(t *testing.T) {
 		newRecord, err := parseRecord(after)
 		if err != nil || newRecord.expires <= oldRecord.expires {
 			t.Fatalf("expiry did not advance: %d %d %v", oldRecord.expires, newRecord.expires, err)
+		}
+		if err := l.Release(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("timed-out renewal delivered after its retry", func(t *testing.T) {
+		// Hold the first renewal past its attempt timeout, let the retry renew,
+		// then deliver the held request. DynamoDB must reject its older expiry.
+		in := liveInput(table)
+		base := client.Options().HTTPClient
+		var renewals atomic.Int32
+		var stale, retried atomic.Int64
+		type heldRequest struct {
+			req  *http.Request
+			body []byte
+		}
+		held, renewed := make(chan heldRequest, 1), make(chan struct{})
+		delayed := dynamodb.New(client.Options(), func(o *dynamodb.Options) {
+			o.HTTPClient = httpFunc(func(req *http.Request) (*http.Response, error) {
+				w, err := readAWSRequest(req)
+				if err != nil {
+					return nil, err
+				}
+				if w.ExpressionAttributeValues[":next"] == nil {
+					return base.Do(req)
+				}
+				switch renewals.Add(1) {
+				case 1:
+					body, err := io.ReadAll(req.Body)
+					if err != nil {
+						return nil, err
+					}
+					stale.Store(wireInt(w, ":next"))
+					<-req.Context().Done()
+					held <- heldRequest{req: req, body: body}
+					return nil, req.Context().Err()
+				case 2:
+					resp, err := base.Do(req)
+					if err == nil && resp.StatusCode == http.StatusOK {
+						retried.Store(wireInt(w, ":next"))
+						close(renewed)
+					}
+					return resp, err
+				}
+				return base.Do(req)
+			})
+		})
+		l, _, err := Lock[keyedData](t.Context(), delayed, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cleanupLease(t, l)
+		// The first attempt is held for its whole timeout before the retry.
+		awaitWithin(t, renewed, in.HeartbeatMaxAge)
+		late := <-held
+		replayCtx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+		replay := late.req.Clone(replayCtx)
+		replay.Body = io.NopCloser(bytes.NewReader(late.body))
+		resp, err := base.Do(replay)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err := errors.Join(err, resp.Body.Close()); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "ConditionalCheckFailedException") {
+			t.Fatalf("late renewal was not rejected: %d %s", resp.StatusCode, body)
+		}
+		item, err := getItem(t.Context(), client, table, in.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := parseRecord(item)
+		if err != nil || stale.Load() >= retried.Load() || record.expires < retried.Load() || l.Context().Err() != nil {
+			t.Fatalf("late renewal shortened the lease: stale=%d retried=%d stored=%d %v %v",
+				stale.Load(), retried.Load(), record.expires, err, context.Cause(l.Context()))
 		}
 		if err := l.Release(t.Context()); err != nil {
 			t.Fatal(err)
@@ -1290,7 +1374,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		await(t, l.Context().Done())
+		awaitWithin(t, l.Context().Done(), in.HeartbeatMaxAge)
 		if !errors.Is(context.Cause(l.Context()), ErrLeaseLost) || !errors.Is(l.Update(t.Context(), &keyedData{}), ErrLeaseLost) {
 			t.Fatalf("ownership loss was not terminal: %v", context.Cause(l.Context()))
 		}

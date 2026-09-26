@@ -31,7 +31,14 @@ type Lease[T any] struct {
 	timer     *time.Timer
 	released  bool
 	finishing chan struct{}
+	// The last failed renewal attempt since confirmation, reported if the
+	// confirmed deadline elapses before another attempt succeeds.
+	renewalErr error
 }
+
+// errRenewalAttemptTimeout distinguishes one abandoned attempt from lease
+// cancellation or the confirmed deadline.
+var errRenewalAttemptTimeout = errors.New("renewal attempt timed out")
 
 func newLease[T any](ctx context.Context, client *dynamodb.Client, in LockInput, owner string, started time.Time) *Lease[T] {
 	leaseCtx, cancel := context.WithCancelCause(ctx)
@@ -66,9 +73,16 @@ func (l *Lease[T]) armDeadlineLocked() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		if l.deadline.Equal(deadline) && !l.released {
-			l.cancel(fmt.Errorf("%w: confirmation deadline elapsed", ErrLeaseLost))
+			l.cancel(l.expiredLocked())
 		}
 	})
+}
+
+func (l *Lease[T]) expiredLocked() error {
+	if l.renewalErr == nil {
+		return fmt.Errorf("%w: confirmation deadline elapsed", ErrLeaseLost)
+	}
+	return fmt.Errorf("%w: confirmation deadline elapsed; last renewal failure: %w", ErrLeaseLost, l.renewalErr)
 }
 
 func (l *Lease[T]) lose(cause error) {
@@ -91,7 +105,7 @@ func (l *Lease[T]) liveErrorLocked() error {
 		return ErrReleased
 	}
 	if !time.Now().Before(l.deadline) || time.Now().UnixNano() >= l.expires {
-		l.cancel(fmt.Errorf("%w: confirmation deadline elapsed", ErrLeaseLost))
+		l.cancel(l.expiredLocked())
 	}
 	if cause := context.Cause(l.ctx); cause != nil {
 		if errors.Is(cause, ErrLeaseLost) {
@@ -108,7 +122,7 @@ func (l *Lease[T]) confirm(started time.Time, expires int64) error {
 	if err := l.liveErrorLocked(); err != nil {
 		return err
 	}
-	l.deadline, l.expires = started.Add(l.input.HeartbeatMaxAge), expires
+	l.deadline, l.expires, l.renewalErr = started.Add(l.input.HeartbeatMaxAge), expires, nil
 	l.armDeadlineLocked()
 	return nil
 }
@@ -138,13 +152,19 @@ func (l *Lease[T]) heartbeat() {
 }
 
 // Every retry gets a fresh proposed expiry but shares the last confirmed
-// deadline. An unconfirmed request cannot extend the local lease budget.
+// deadline. An unconfirmed request cannot extend the local lease budget, so
+// transient failures are retried until that deadline rather than a fixed count.
+// Each attempt times out after half the lease, so after a stuck request at most
+// half the lease minus the heartbeat interval remains for retries; backoff and
+// delayed renewal starts shorten it. Any finite cap abandons some slow responses
+// that might have arrived before the deadline.
 func (l *Lease[T]) renew() error {
 	l.mu.Lock()
 	deadline, confirmedExpiry := l.deadline, l.expires
 	l.mu.Unlock()
 	ctx, cancel := context.WithDeadline(l.ctx, deadline)
 	defer cancel()
+	attemptTimeout := l.input.HeartbeatMaxAge / 2
 	for attempt := 0; ; attempt++ {
 		if err := l.liveError(); err != nil {
 			return err
@@ -154,7 +174,8 @@ func (l *Lease[T]) renew() error {
 		if expires <= confirmedExpiry {
 			return errors.New("wall clock moved backward during renewal")
 		}
-		_, err := l.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		attemptCtx, cancelAttempt := context.WithTimeoutCause(ctx, attemptTimeout, errRenewalAttemptTimeout)
+		_, err := l.client.UpdateItem(attemptCtx, &dynamodb.UpdateItemInput{
 			TableName: aws.String(l.input.Table), Key: key(l.input.ID),
 			UpdateExpression:         aws.String("SET #expires = :next"),
 			ConditionExpression:      aws.String("#owner = :owner AND #expires > :now AND #expires < :next"),
@@ -165,6 +186,8 @@ func (l *Lease[T]) renew() error {
 			},
 			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 		}, noSDKRetry)
+		timedOut := errors.Is(err, context.DeadlineExceeded) && context.Cause(attemptCtx) == errRenewalAttemptTimeout
+		cancelAttempt()
 		if err == nil {
 			return l.confirm(started, expires)
 		}
@@ -183,20 +206,37 @@ func (l *Lease[T]) renew() error {
 				// confirmation deadline still bounds this wait.
 				select {
 				case <-ctx.Done():
-					return ctx.Err()
+					return l.renewalStopped(ctx.Err())
 				case <-finishing:
 					return nil
 				}
 			}
 			return errors.Join(err, parseErr)
 		}
-		if !retryable(err) || attempt+1 >= maxAttempts {
+		if ctx.Err() != nil {
+			return l.renewalStopped(err)
+		}
+		if timedOut {
+			err = fmt.Errorf("%w after %v", errRenewalAttemptTimeout, attemptTimeout)
+		} else if !renewalRetryable(err) {
 			return err
 		}
+		l.mu.Lock()
+		l.renewalErr = err
+		l.mu.Unlock()
 		if err := backoff(ctx, attempt); err != nil {
-			return err
+			return l.renewalStopped(err)
 		}
 	}
+}
+
+// Report why retries stopped: loss, release, parent cancellation, or the
+// elapsed confirmation deadline with its last renewal failure.
+func (l *Lease[T]) renewalStopped(err error) error {
+	if liveErr := l.liveError(); liveErr != nil {
+		return liveErr
+	}
+	return err
 }
 
 func (l *Lease[T]) beginOperation(ctx context.Context) error {
