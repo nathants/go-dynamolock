@@ -186,7 +186,7 @@ func (l *Lease[T]) renew() error {
 			},
 			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 		}, noSDKRetry)
-		timedOut := errors.Is(err, context.DeadlineExceeded) && context.Cause(attemptCtx) == errRenewalAttemptTimeout
+		timedOut := errors.Is(err, context.DeadlineExceeded) && errors.Is(context.Cause(attemptCtx), errRenewalAttemptTimeout)
 		cancelAttempt()
 		if err == nil {
 			return l.confirm(started, expires)

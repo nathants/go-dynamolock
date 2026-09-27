@@ -260,8 +260,7 @@ func retryable(err error) bool {
 // deadline. The SDK marks every send failure retryable, so classify them here:
 // TLS trust and request configuration errors remain fatal.
 func renewalRetryable(err error) bool {
-	var send *smithyhttp.RequestSendError
-	if !errors.As(err, &send) {
+	if _, ok := errors.AsType[*smithyhttp.RequestSendError](err); !ok {
 		return retryable(err)
 	}
 	var verification *tls.CertificateVerificationError

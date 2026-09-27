@@ -153,8 +153,8 @@ func TestLiveFixtureLifecycle(t *testing.T) {
 				value = ""
 			}
 			// This is an isolated subprocess: leave the changed environment in
-			// place through cleanup, rather than restoring it with t.Setenv.
-			if err := os.Setenv("REUSE", value); err != nil {
+			// place through cleanup.
+			if err := os.Setenv("REUSE", value); err != nil { //nolint:usetesting // t.Setenv would restore it before fixture cleanup.
 				t.Fatal(err)
 			}
 		}

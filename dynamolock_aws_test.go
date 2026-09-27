@@ -183,10 +183,7 @@ func ClearTable(ctx context.Context, client *dynamodb.Client, table string) erro
 			if len(reqs) == 0 {
 				return nil
 			}
-			delay := time.Duration(attempt+1) * 200 * time.Millisecond
-			if delay > 2*time.Second {
-				delay = 2 * time.Second
-			}
+			delay := min(time.Duration(attempt+1)*200*time.Millisecond, 2*time.Second)
 			timer := time.NewTimer(delay)
 			select {
 			case <-timer.C:
@@ -282,7 +279,7 @@ func TestReadModifyWrite(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	max := 50
-	var inCriticalSection int32
+	var inCriticalSection atomic.Int32
 	done := make(chan error, max)
 	var workers sync.WaitGroup
 	defer func() {
@@ -314,7 +311,7 @@ func TestReadModifyWrite(t *testing.T) {
 					done <- err
 					return
 				}
-				if !atomic.CompareAndSwapInt32(&inCriticalSection, 0, 1) {
+				if !inCriticalSection.CompareAndSwap(0, 1) {
 					done <- fmt.Errorf("lock allowed concurrent critical sections")
 					return
 				}
@@ -323,7 +320,7 @@ func TestReadModifyWrite(t *testing.T) {
 					data = &counter{}
 				}
 				data.Count++
-				atomic.StoreInt32(&inCriticalSection, 0)
+				inCriticalSection.Store(0)
 				done <- lease.Commit(lease.Context(), data)
 				return
 			}

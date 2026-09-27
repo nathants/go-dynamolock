@@ -55,10 +55,13 @@ guidance here and implementation rationale beside the relevant code.
 
 Run from the repository root with installed Go 1.27 and `GOTOOLCHAIN=local`.
 
-- Gate: `bash bin/check.sh`. It requires its tools on PATH and never installs
-  them. Formatting is check-only; analysis is followed by explicitly disarmed
-  offline race tests. Tool versions are environment-supplied. The go-hasdefer,
-  go-hasdefault, and golint stages are advisory and labeled as such.
+- Gate: `bash bin/check.sh`. It requires `libcheck` on PATH
+  (github.com/nathants/libcheck; read its readme before changing lint setup) and
+  runs the shared lint policy with `libcheck check`, then `libcheck security`
+  (govulncheck; needs network) and explicitly disarmed offline race tests. Lint
+  policy lives in libcheck: add no engine configs or output filtering here.
+  Suppress a finding only when it is wrong for that line, with
+  `//nolint:LINTER // reason`; repository-wide exceptions go in `libcheck.json`.
 - Tests alone: `DYNAMOLOCK_TEST_ACCOUNT= bash test.sh`. This runs uncached race
   tests with a two-minute timeout and forwards additional `go test` flags, e.g.
   `-run '^TestProtocol'`. Explicitly disarm live tests for offline runs.
