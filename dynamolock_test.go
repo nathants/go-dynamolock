@@ -368,6 +368,10 @@ type httpFunc func(*http.Request) (*http.Response, error)
 func (f httpFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
 
 type wireRequest struct {
+	ProjectionExpression                string
+	FilterExpression                    string
+	Segment                             int32
+	TotalSegments                       int32
 	IndexName                           string
 	Select                              string
 	Limit                               int32

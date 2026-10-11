@@ -184,6 +184,25 @@ An index projecting `data` must project the whole map and either both lease fiel
 or neither. Discovery is read-only, may be eventually consistent, and is not a
 collection snapshot. Acquire the actual document before modifying it.
 
+For read-only paths that must not load private fields, use `ReadProjected[T]` or
+`ScanProjected[T]` with explicit payload paths such as `[][]string{{"public"},
+{"nested", "status"}}`. Each segment is an exact stored attribute name, not a
+Go field name, dotted expression or list index. Empty fields select keys and lease
+metadata only; empty paths, duplicate paths and ancestor overlaps are rejected.
+The request includes primary keys, both lease fields and only the selected data.
+It never fetches the complete document or silently rereads it.
+
+These APIs return distinct `ProjectedItem[T]` / `ProjectedPage[T]` types to mark
+incomplete observations. `ReadProjected` is strongly consistent; a nil item means
+absence. A present item with nil `Value` returned none of the selected data, not
+proof the full payload is absent or valid. `HasLeaseMetadata` reports a valid
+owner/expiry pair even if expired, never ownership or live-lease authority.
+Malformed returned metadata and payload are errors. `ScanProjected` is base-table
+only, preserves SDK filter, consistency, limit, segment and continuation options,
+and clones expression aliases. Caller projection and `Select` options are rejected;
+indexes might omit lease metadata. The full-object APIs retain their strict
+projection/envelope checks. Acquire the complete owner before any mutation.
+
 ## Lease lifetime
 
 `HeartbeatMaxAge` is the lease duration. Choose a shorter `HeartbeatInterval`

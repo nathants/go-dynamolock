@@ -46,7 +46,10 @@ guidance here and implementation rationale beside the relevant code.
 - Query/Scan return one page, preserve full service cursors, never take leases or
   silently reread. Reject partial projections. Only explicit index discovery may
   return a key with nil Value despite unknown outer fields and missing data; base
-  table discovery keeps the strict envelope checks.
+  table discovery keeps the strict envelope checks. Projected Read/Scan expose
+  explicitly incomplete read-only values with exact selected payload paths plus
+  keys and both lease fields; base-table only, no full reread or writer capability.
+  Missing selected data never proves the complete payload is absent or valid.
 - `RequireExisting` checks item existence at acquisition, not payload presence
   or a generation of the key. It does not detect deletion followed by recreation.
 - The holder establishes expiry in Unix nanoseconds. Takeover requires
