@@ -9,7 +9,8 @@ guidance here and implementation rationale beside the relevant code.
 
 - `dynamolock.go`: acquisition, reads, and shared request/retry helpers.
 - `lease.go`: lease state, lifetime, renewal, and payload operations.
-- `codec.go`: envelope encoding and identity validation.
+- `codec.go`, `table.go`: envelope encoding, primary keys and schema validation.
+- `discovery.go`: typed one-page Query/Scan using SDK read options.
 - `payload.go`, `projection.go`: field-preserving merging and SDK field-name mapping.
 - `main_test.go`: mandatory AWS setup and account verification for every test run.
 - `dynamolock_test.go`, `payload_test.go`: scripted protocol and fixture tests.
@@ -17,9 +18,10 @@ guidance here and implementation rationale beside the relevant code.
 
 ## Protocol invariants
 
-- One item per string partition key `id`; no sort key. The only outer attributes
-  are `id`, `owner_token`, `expires_at`, and `data`. Ownership fields are present
-  together; payloads live under `data`. There is no flat-record fallback.
+- One item per string partition key (default `id`), optionally with a string sort
+  key. Primary keys, `owner_token`, `expires_at`, `data` and projected attributes
+  live outside the payload. Ownership fields are present together. Unknown outer
+  attributes require a real `data` envelope; there is no flat-record fallback.
 - Identity is stored only outside `data`, injected on decode, and validated and
   removed on encode, including case aliases recognized by the SDK. Encoding and
   decoding must not mutate caller-owned attribute maps.
@@ -33,10 +35,18 @@ guidance here and implementation rationale beside the relevant code.
   data remain distinct. Interface numbers decode as `attributevalue.Number`; typed
   numeric fields retain their Go types.
 - Acquisition obtains ownership and the payload in one conditional UpdateItem.
-  Heartbeats update only `expires_at`; application updates write only the merged
-  `data` map. Commit writes that map and removes ownership atomically. Advance
-  raw/visible snapshots only after confirmed writes. Release preserves the raw
+  Heartbeats update only `expires_at`; application updates write the merged
+  `data` map and configured outer projections in one operation. Commit removes
+  ownership atomically. Projection values come from the merged payload, including
+  fields hidden by typed decoding; missing configured fields remove projections.
+  Advance raw/visible snapshots only after confirmed writes. Release preserves the raw
   payload and is conditional only on this handle's token, even after loss.
+- `Delete` uses the live ownership/expiry fence, joins renewal on success and
+  loses the handle on an ambiguous result. It never blindly retries ambiguity.
+- Query/Scan return one page, preserve full service cursors, never take leases or
+  silently reread. Reject partial projections. Only explicit index discovery may
+  return a key with nil Value despite unknown outer fields and missing data; base
+  table discovery keeps the strict envelope checks.
 - `RequireExisting` checks item existence at acquisition, not payload presence
   or a generation of the key. It does not detect deletion followed by recreation.
 - The holder establishes expiry in Unix nanoseconds. Takeover requires
@@ -93,7 +103,8 @@ DYNAMOLOCK_TEST_ACCOUNT="${EXPECTED_ACCOUNT:?}" GOTOOLCHAIN=local \
 ```
 
 All live tests use `liveTable`. By default each creates and deletes a disposable
-table. Any nonempty `REUSE` instead selects the dedicated `go-dynamolock` test
+table. Custom-schema fixtures always use disposable tables. For the default schema,
+any nonempty `REUSE` instead selects the dedicated `go-dynamolock` test
 table and **clears every item before and after each test**. Never put application
 data there or run reusable-table suites concurrently.
 

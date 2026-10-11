@@ -1,5 +1,5 @@
 // Package dynamolock coordinates leases and atomic payload writes on DynamoDB
-// items with a string partition key named id. It does not fence external effects.
+// items with string primary keys. It does not fence external effects.
 package dynamolock
 
 import (
@@ -47,8 +47,8 @@ var ErrOutcomeUnknown = errors.New("write outcome unknown")
 // LockInput configures acquisition and renewal. Lock copies it before use;
 // callers may reuse it after Lock returns, but must not mutate it during Lock.
 type LockInput struct {
-	Table             string
-	ID                string
+	Table             Table
+	Key               Key
 	RequireExisting   bool          // Check item existence, not payload presence.
 	HeartbeatMaxAge   time.Duration // Duration of each lease, established by its holder.
 	HeartbeatInterval time.Duration // Measured from the last confirmed request's start.
@@ -58,18 +58,23 @@ type LockInput struct {
 
 // Read performs a strongly consistent payload read without taking a lease.
 // It can observe Update before Commit or Release.
-func Read[T any](ctx context.Context, client *dynamodb.Client, table, id string) (*T, error) {
-	if err := validateTarget(ctx, client, table, id); err != nil {
+func Read[T any](ctx context.Context, client *dynamodb.Client, table Table, key Key) (*T, error) {
+	var err error
+	table, err = table.normalized()
+	if err != nil {
+		return nil, err
+	}
+	if err := validateTarget(ctx, client, table, key); err != nil {
 		return nil, err
 	}
 	if err := validateType[T](); err != nil {
 		return nil, err
 	}
-	item, err := getItem(ctx, client, table, id)
+	item, err := getItem(ctx, client, table, key)
 	if err != nil {
 		return nil, err
 	}
-	return UnmarshalItem[T](item)
+	return UnmarshalItem[T](table, item)
 }
 
 // Lock atomically acquires ownership and returns the payload. The context owns
@@ -84,7 +89,11 @@ func Lock[T any](ctx context.Context, client *dynamodb.Client, input *LockInput)
 		return nil, nil, errors.New("nil LockInput")
 	}
 	in := *input
-	if err := validateTarget(ctx, client, in.Table, in.ID); err != nil {
+	in.Table, err = in.Table.normalized()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateTarget(ctx, client, in.Table, in.Key); err != nil {
 		return nil, nil, err
 	}
 	if err := validateType[T](); err != nil {
@@ -121,23 +130,23 @@ func Lock[T any](ctx context.Context, client *dynamodb.Client, input *LockInput)
 			}
 		}
 	}()
-	r, err := parseRecord(item)
+	r, err := parseRecord(in.Table, item)
 	if err != nil {
 		return nil, nil, err
 	}
-	if r.id != in.ID || r.owner != owner || r.expires != started.Add(in.HeartbeatMaxAge).UnixNano() {
+	if r.key != in.Key || r.owner != owner || r.expires != started.Add(in.HeartbeatMaxAge).UnixNano() {
 		return nil, nil, fmt.Errorf("%w: acquisition returned unexpected ownership", ErrInvalidRecord)
 	}
 	l.raw, err = snapshotPayload(r.data)
 	if err != nil {
 		return nil, nil, err
 	}
-	data, err = UnmarshalItem[T](item)
+	data, err = UnmarshalItem[T](in.Table, item)
 	if err != nil {
 		return nil, nil, err
 	}
 	if data != nil {
-		visible, encodeErr := marshalPayload(in.ID, data)
+		visible, encodeErr := marshalPayload(in.Table, in.Key, data)
 		if encodeErr != nil {
 			return nil, nil, encodeErr
 		}
@@ -153,11 +162,11 @@ func Lock[T any](ctx context.Context, client *dynamodb.Client, input *LockInput)
 	return l, data, nil
 }
 
-func validateTarget(ctx context.Context, client *dynamodb.Client, table, id string) error {
-	if ctx == nil || client == nil || table == "" {
+func validateTarget(ctx context.Context, client *dynamodb.Client, table Table, key Key) error {
+	if ctx == nil || client == nil || table.Name == "" {
 		return errors.New("context, DynamoDB client, and table are required")
 	}
-	if err := validateID(id); err != nil {
+	if err := table.validateKey(key); err != nil {
 		return err
 	}
 	return ctx.Err()
@@ -181,10 +190,10 @@ func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner s
 		}
 		names := map[string]string{"#owner": "owner_token", "#expires": "expires_at"}
 		if in.RequireExisting {
-			names["#id"] = "id"
+			names["#id"] = in.Table.PartitionKey
 		}
 		output, err := client.UpdateItem(attemptCtx, &dynamodb.UpdateItemInput{
-			TableName: aws.String(in.Table), Key: key(in.ID),
+			TableName: aws.String(in.Table.Name), Key: in.Table.key(in.Key),
 			ConditionExpression:      aws.String(condition),
 			UpdateExpression:         aws.String("SET #owner = :owner, #expires = :expires"),
 			ExpressionAttributeNames: names,
@@ -201,7 +210,7 @@ func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner s
 		}
 		if failure, ok := conditionalFailure(err); ok {
 			cancel()
-			if _, parseErr := parseRecord(failure.Item); parseErr != nil {
+			if _, parseErr := parseRecord(in.Table, failure.Item); parseErr != nil {
 				return nil, started, parseErr
 			}
 			if in.RequireExisting && len(failure.Item) == 0 {
@@ -220,8 +229,8 @@ func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner s
 			// Do not resend an ambiguous acquire: a delayed create could reclaim
 			// an already released key. A strong read of our unique token can
 			// confirm the original acquisition without another ownership write.
-			item, readErr := getItem(attemptCtx, client, in.Table, in.ID)
-			confirmed := readErr == nil && acquisitionConfirmed(item, in.ID, owner, expires.UnixNano())
+			item, readErr := getItem(attemptCtx, client, in.Table, in.Key)
+			confirmed := readErr == nil && acquisitionConfirmed(in.Table, item, in.Key, owner, expires.UnixNano())
 			cancel()
 			if confirmed {
 				return item, started, nil
@@ -241,12 +250,12 @@ func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner s
 
 // Confirm ownership independently of payload decoding, so a corrupt payload
 // still takes the ordinary post-acquisition cleanup path.
-func acquisitionConfirmed(item map[string]types.AttributeValue, id, owner string, expires int64) bool {
-	k, keyOK := item["id"].(*types.AttributeValueMemberS)
+func acquisitionConfirmed(table Table, item map[string]types.AttributeValue, key Key, owner string, expires int64) bool {
+	k, keyErr := table.readKey(item)
 	o, ownerOK := item["owner_token"].(*types.AttributeValueMemberS)
 	e, expiryOK := item["expires_at"].(*types.AttributeValueMemberN)
-	return keyOK && ownerOK && expiryOK && k != nil && o != nil && e != nil &&
-		k.Value == id && o.Value == owner && e.Value == strconv.FormatInt(expires, 10)
+	return keyErr == nil && ownerOK && expiryOK && o != nil && e != nil &&
+		k == key && o.Value == owner && e.Value == strconv.FormatInt(expires, 10)
 }
 
 const maxAttempts = 5
@@ -328,10 +337,10 @@ func backoff(ctx context.Context, attempt int) error {
 	return wait(ctx, ceiling/2+time.Duration(mathrand.Int64N(int64(ceiling/2))))
 }
 
-func getItem(ctx context.Context, client *dynamodb.Client, table, id string) (map[string]types.AttributeValue, error) {
+func getItem(ctx context.Context, client *dynamodb.Client, table Table, key Key) (map[string]types.AttributeValue, error) {
 	for attempt := 0; ; attempt++ {
 		output, err := client.GetItem(ctx, &dynamodb.GetItemInput{
-			TableName: aws.String(table), Key: key(id), ConsistentRead: aws.Bool(true),
+			TableName: aws.String(table.Name), Key: table.key(key), ConsistentRead: aws.Bool(true),
 		}, noSDKRetry)
 		if err == nil {
 			return output.Item, nil

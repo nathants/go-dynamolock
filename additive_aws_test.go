@@ -23,7 +23,7 @@ func TestLeaseAdditiveAWS(t *testing.T) {
 		"Known": "before", "Remove": "remove intentionally", "future": "retain",
 		"Nested": map[string]any{"KNOWN": "before", "future": "retain nested"},
 	}
-	item, err := MarshalItem("key", original)
+	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestLeaseAdditiveAWS(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := liveInput(table)
-	input.ID = "key"
+	input.Key.Partition = "key"
 	lease, data, err := Lock[oldData](t.Context(), client, input)
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,7 @@ func TestLeaseAdditiveAWS(t *testing.T) {
 	}
 	check := func(expected map[string]any) {
 		t.Helper()
-		actual, err := Read[map[string]any](t.Context(), client, table, "key")
+		actual, err := Read[map[string]any](t.Context(), client, Table{Name: table}, Key{Partition: "key"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -86,7 +86,7 @@ func TestLeaseOpaqueListAWS(t *testing.T) {
 		"count":   1,
 		"members": []map[string]any{{"name": "before", "future": "retain"}},
 	}
-	item, err := MarshalItem(input.ID, original)
+	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: input.Key.Partition}, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,11 +114,11 @@ func TestLeaseOpaqueListAWS(t *testing.T) {
 		t.Fatal(err)
 	}
 	original["count"] = 2
-	expected, err := MarshalItem(input.ID, original)
+	expected, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: input.Key.Partition}, original)
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, err := getItem(t.Context(), client, table, input.ID)
+	actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, input.Key)
 	if err != nil || !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("opaque list or ownership changed: %#v %v", actual, err)
 	}
@@ -147,11 +147,11 @@ func TestLeaseEmptyMapAWS(t *testing.T) {
 	if err := lease.Commit(lease.Context(), &value); err != nil {
 		t.Fatal(err)
 	}
-	expected, err := MarshalItem(input.ID, value)
+	expected, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: input.Key.Partition}, value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual, err := getItem(t.Context(), client, table, input.ID)
+	actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, input.Key)
 	if err != nil || !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("explicit map deletion or initialization changed: %#v %v", actual, err)
 	}

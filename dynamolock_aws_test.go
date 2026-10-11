@@ -30,21 +30,21 @@ type Data struct {
 	Value string `json:"value" dynamodbav:"value"`
 }
 
-func liveTable(t *testing.T) (*dynamodb.Client, string) {
+func liveTable(t *testing.T, configure ...func(*dynamodb.CreateTableInput)) (*dynamodb.Client, string) {
 	t.Helper()
 	client := awsTestClient
-	reuse := os.Getenv("REUSE") != ""
+	reuse := os.Getenv("REUSE") != "" && len(configure) == 0
 	table := "test-go-dynamolock-" + Uid()
 	if reuse {
 		table = "go-dynamolock"
 	}
-	setupTable(t, client, table, reuse)
+	setupTable(t, client, table, reuse, configure...)
 	return client, table
 }
 
 // setupTable requires an account-checked client. Keep the captured reuse mode
 // for cleanup so later environment changes cannot switch clearing and deletion.
-func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool) {
+func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool, configure ...func(*dynamodb.CreateTableInput)) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -63,6 +63,9 @@ func setupTable(t *testing.T, client *dynamodb.Client, table string, reuse bool)
 		TableName: aws.String(table), BillingMode: types.BillingModePayPerRequest,
 		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS}},
 		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash}},
+	}
+	for _, apply := range configure {
+		apply(input)
 	}
 	out, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
 	var absent *types.ResourceNotFoundException
@@ -218,8 +221,8 @@ func TestBasic(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -231,8 +234,8 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("data should be nil")
 	}
 	contender, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -272,8 +275,8 @@ func TestReadModifyWrite(t *testing.T) {
 				default:
 				}
 				lease, data, err := Lock[counter](ctx, client, &LockInput{
-					Table:             table,
-					ID:                id,
+					Table:             Table{Name: table},
+					Key:               Key{Partition: id},
 					HeartbeatMaxAge:   liveLease,
 					HeartbeatInterval: time.Second * 1,
 					Retries:           5,
@@ -308,7 +311,7 @@ func TestReadModifyWrite(t *testing.T) {
 		}
 	}
 	// Local exclusion is not enough: the stored counter must include every worker.
-	stored, err := Read[counter](ctx, client, table, id)
+	stored, err := Read[counter](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil || stored == nil || stored.Count != max {
 		t.Fatalf("persisted counter = %#v, err = %v; want %d", stored, err, max)
 	}
@@ -325,8 +328,8 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 
 	id := Uid()
 	unlock, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   2 * time.Minute,
 		HeartbeatInterval: time.Minute,
 	})
@@ -366,8 +369,8 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 		defer close(finished)
 		delayedCtx := context.WithValue(contenderCtx, delayAcquireContextKey{}, true)
 		unlock, data, err := Lock[Data](delayedCtx, delayedClient, &LockInput{
-			Table:             table,
-			ID:                id,
+			Table:             Table{Name: table},
+			Key:               Key{Partition: id},
 			HeartbeatMaxAge:   30 * time.Second,
 			HeartbeatInterval: 15 * time.Second,
 		})
@@ -386,8 +389,8 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 	}
 
 	otherUnlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   2 * time.Minute,
 		HeartbeatInterval: time.Minute,
 	})
@@ -455,8 +458,8 @@ func TestData(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[testData](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -472,8 +475,8 @@ func TestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	unlock, data, err = Lock[testData](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -486,7 +489,7 @@ func TestData(t *testing.T) {
 	} else if data.Value != "asdf" {
 		t.Fatal("data mismatch")
 	}
-	read, err := Read[testData](ctx, client, table, id)
+	read, err := Read[testData](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,8 +503,8 @@ func TestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	unlock, data, err = Lock[testData](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -526,8 +529,8 @@ func TestLockRequireExisting(t *testing.T) {
 
 	id := "require-existing"
 	missing, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		RequireExisting:   true,
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
@@ -544,7 +547,7 @@ func TestLockRequireExisting(t *testing.T) {
 	if errors.Is(err, ErrLockHeld) {
 		t.Fatalf("missing item incorrectly matched ErrLockHeld: %v", err)
 	}
-	data, err := Read[Data](ctx, client, table, id)
+	data, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,8 +556,8 @@ func TestLockRequireExisting(t *testing.T) {
 	}
 
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
 	})
@@ -570,8 +573,8 @@ func TestLockRequireExisting(t *testing.T) {
 	}
 
 	unlock, data, err = Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		RequireExisting:   true,
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
@@ -585,8 +588,8 @@ func TestLockRequireExisting(t *testing.T) {
 	}
 
 	contender, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		RequireExisting:   true,
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
@@ -614,7 +617,7 @@ type preExistingData struct {
 func TestPreExistingData(t *testing.T) {
 	ctx := t.Context()
 	client, table := liveTable(t)
-	item, err := MarshalItem("test-id", preExistingData{
+	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "test-id"}, preExistingData{
 		ID:    "test-id",
 		Value: "test-value",
 	})
@@ -630,8 +633,8 @@ func TestPreExistingData(t *testing.T) {
 	}
 	id := "test-id"
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -645,8 +648,8 @@ func TestPreExistingData(t *testing.T) {
 		t.Fatal("wrong value")
 	}
 	contender, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -658,7 +661,7 @@ func TestPreExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := Read[preExistingData](ctx, client, table, id)
+	stored, err := Read[preExistingData](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil || stored == nil || stored.ID != id || stored.Value != "test-value" {
 		t.Fatalf("commit did not preserve the pre-existing payload: %#v %v", stored, err)
 	}
@@ -669,8 +672,8 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	client, table := liveTable(t)
 	id := "test-id"
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   time.Second * 30,
 		HeartbeatInterval: time.Second * 1,
 	})
@@ -687,7 +690,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err := Read[Data](ctx, client, table, id)
+	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +705,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err = Read[Data](ctx, client, table, id)
+	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +724,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err = Read[Data](ctx, client, table, id)
+	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,7 +733,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	} else if read.Value != "bar" {
 		t.Fatal("wrong value")
 	}
-	read, err = Read[Data](ctx, client, table, "404")
+	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: "404"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -744,8 +747,8 @@ func TestUnlockTwiceFails(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
@@ -772,8 +775,8 @@ func TestContextCancelBeforeLock(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   2 * time.Second,
 		HeartbeatInterval: 1 * time.Second,
 	})
@@ -791,8 +794,8 @@ func TestContextCancelExpired(t *testing.T) {
 	firstCtx, cancelFirst := context.WithCancel(ctx)
 	defer cancelFirst()
 	first, _, err := Lock[Data](firstCtx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
@@ -807,8 +810,8 @@ func TestContextCancelExpired(t *testing.T) {
 	await(t, first.done)
 	time.Sleep(liveLease + 2*time.Second)
 	second, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
@@ -831,14 +834,14 @@ func TestContextCancelExpired(t *testing.T) {
 	if err := first.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	stored, err := Read[Data](ctx, client, table, id)
+	stored, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil || stored == nil || stored.Value != "successor" {
 		t.Fatalf("stale handle changed the successor's payload: %#v %v", stored, err)
 	}
 	if err := second.Commit(second.Context(), &Data{Value: "committed"}); err != nil {
 		t.Fatalf("stale cleanup disturbed successor ownership: %v", err)
 	}
-	stored, err = Read[Data](ctx, client, table, id)
+	stored, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil || stored == nil || stored.Value != "committed" {
 		t.Fatalf("successor commit did not persist: %#v %v", stored, err)
 	}
@@ -849,8 +852,8 @@ func TestCommitEmptyData(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
@@ -865,7 +868,7 @@ func TestCommitEmptyData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error committing empty data, got: %v", err)
 	}
-	read, err := Read[Data](ctx, client, table, id)
+	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -882,8 +885,8 @@ func TestUpdateEmptyData(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
@@ -898,7 +901,7 @@ func TestUpdateEmptyData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error updating with empty data, got: %v", err)
 	}
-	read, err := Read[Data](ctx, client, table, id)
+	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -922,8 +925,8 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	first, _, err := Lock[Data](cancelCtx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 	})
@@ -935,8 +938,8 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	cancel()
 
 	unlock2, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             table,
-		ID:                id,
+		Table:             Table{Name: table},
+		Key:               Key{Partition: id},
 		HeartbeatMaxAge:   liveLease,
 		HeartbeatInterval: 1 * time.Second,
 		Retries:           100,
@@ -957,7 +960,7 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 const liveLease = 30 * time.Second
 
 func liveInput(table string) *LockInput {
-	return &LockInput{Table: table, ID: Uid(), HeartbeatMaxAge: liveLease, HeartbeatInterval: time.Second}
+	return &LockInput{Table: Table{Name: table}, Key: Key{Partition: Uid()}, HeartbeatMaxAge: liveLease, HeartbeatInterval: time.Second}
 }
 
 // Inspect a request for fault injection without consuming the body sent to AWS.
@@ -1012,7 +1015,7 @@ func TestLeaseAWS(t *testing.T) {
 	client, table := liveTable(t)
 	t.Run("release preserves raw payload and identity", func(t *testing.T) {
 		in := liveInput(table)
-		item, err := MarshalItem(in.ID, keyedData{Value: "retained"})
+		item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: in.Key.Partition}, keyedData{Value: "retained"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1026,13 +1029,13 @@ func TestLeaseAWS(t *testing.T) {
 			t.Fatal(err)
 		}
 		cleanupLease(t, l)
-		if data == nil || data.ID != in.ID || data.Value != "retained" {
+		if data == nil || data.ID != in.Key.Partition || data.Value != "retained" {
 			t.Fatalf("acquired payload: %#v", data)
 		}
 		if err := l.Release(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		actual, err := getItem(t.Context(), client, table, in.ID)
+		actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil || !reflect.DeepEqual(actual, item) {
 			t.Fatalf("release changed raw payload: %#v %v", actual, err)
 		}
@@ -1045,7 +1048,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err := l.Update(t.Context(), data); err != nil {
 			t.Fatal(err)
 		}
-		read, err := Read[keyedData](t.Context(), client, table, in.ID)
+		read, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition})
 		if err != nil || read == nil || *read != *data {
 			t.Fatalf("checkpoint not visible while held: %#v %v", read, err)
 		}
@@ -1062,11 +1065,11 @@ func TestLeaseAWS(t *testing.T) {
 		if err := l.Commit(t.Context(), &keyedData{Value: "committed"}); err != nil {
 			t.Fatal(err)
 		}
-		actual, err = getItem(t.Context(), client, table, in.ID)
+		actual, err = getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		want, err := MarshalItem(in.ID, keyedData{Value: "committed"})
+		want, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: in.Key.Partition}, keyedData{Value: "committed"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1107,12 +1110,12 @@ func TestLeaseAWS(t *testing.T) {
 		if err := second.Commit(t.Context(), &keyedData{Value: "successor"}); err != nil {
 			t.Fatal(err)
 		}
-		read, err := Read[keyedData](t.Context(), client, table, in.ID)
+		read, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition})
 		if err != nil || read == nil || read.Value != "successor" {
 			t.Fatalf("stale cleanup disturbed successor: %#v %v", read, err)
 		}
 	})
-	for _, operation := range []string{"update", "commit"} {
+	for _, operation := range []string{"update", "commit", "delete"} {
 		t.Run("delayed stale "+operation, func(t *testing.T) {
 			in := liveInput(table)
 			// The successor must outlast the first lease, then finish its own writes.
@@ -1139,7 +1142,7 @@ func TestLeaseAWS(t *testing.T) {
 					if err != nil {
 						return nil, err
 					}
-					if w.ExpressionAttributeValues[":data"] == nil {
+					if w.ExpressionAttributeValues[":data"] == nil && w.Target != "DynamoDB_20120810.DeleteItem" {
 						return base.Do(req)
 					}
 					payloadCalls++
@@ -1179,6 +1182,8 @@ func TestLeaseAWS(t *testing.T) {
 			write := first.Update
 			if operation == "commit" {
 				write = first.Commit
+			} else if operation == "delete" {
+				write = func(ctx context.Context, _ *keyedData) error { return first.Delete(ctx) }
 			}
 			result := make(chan error, 1)
 			workers.Go(func() { result <- write(first.Context(), &keyedData{Value: "stale"}) })
@@ -1196,11 +1201,11 @@ func TestLeaseAWS(t *testing.T) {
 			if err := second.Update(ctx, &keyedData{Value: "successor"}); err != nil {
 				t.Fatal(err)
 			}
-			before, err := getItem(ctx, client, table, in.ID)
+			before, err := getItem(ctx, client, Table{Name: table, PartitionKey: "id"}, in.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
-			r, err := parseRecord(before)
+			r, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, before)
 			if err != nil || r.owner != second.owner || r.data == nil {
 				t.Fatalf("successor did not establish ownership and payload: %v", err)
 			}
@@ -1220,7 +1225,7 @@ func TestLeaseAWS(t *testing.T) {
 			if !errors.Is(writeErr, ErrLeaseLost) && !errors.Is(writeErr, ErrOutcomeUnknown) {
 				t.Fatalf("stale in-flight %s result: %v", operation, writeErr)
 			}
-			after, err := getItem(ctx, client, table, in.ID)
+			after, err := getItem(ctx, client, Table{Name: table, PartitionKey: "id"}, in.Key)
 			if err != nil || !reflect.DeepEqual(after["data"], before["data"]) || !reflect.DeepEqual(after["owner_token"], before["owner_token"]) {
 				t.Fatalf("stale %s changed successor payload or ownership: %v", operation, err)
 			}
@@ -1237,7 +1242,7 @@ func TestLeaseAWS(t *testing.T) {
 			t.Fatal(err)
 		}
 		cleanupLease(t, l)
-		before, err := getItem(t.Context(), client, table, in.ID)
+		before, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1245,12 +1250,12 @@ func TestLeaseAWS(t *testing.T) {
 		if l.Context().Err() != nil || injected.Load() != 1 {
 			t.Fatalf("renewal stopped: injected=%d cause=%v", injected.Load(), context.Cause(l.Context()))
 		}
-		after, err := getItem(t.Context(), client, table, in.ID)
+		after, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		oldRecord, _ := parseRecord(before)
-		newRecord, err := parseRecord(after)
+		oldRecord, _ := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, before)
+		newRecord, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, after)
 		if err != nil || newRecord.expires <= oldRecord.expires {
 			t.Fatalf("expiry did not advance: %d %d %v", oldRecord.expires, newRecord.expires, err)
 		}
@@ -1323,11 +1328,11 @@ func TestLeaseAWS(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "ConditionalCheckFailedException") {
 			t.Fatalf("late renewal was not rejected: %d %s", resp.StatusCode, body)
 		}
-		item, err := getItem(t.Context(), client, table, in.ID)
+		item, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		record, err := parseRecord(item)
+		record, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, item)
 		if err != nil || stale.Load() >= retried.Load() || record.expires < retried.Load() || l.Context().Err() != nil {
 			t.Fatalf("late renewal shortened the lease: stale=%d retried=%d stored=%d %v %v",
 				stale.Load(), retried.Load(), record.expires, err, context.Cause(l.Context()))
@@ -1344,7 +1349,7 @@ func TestLeaseAWS(t *testing.T) {
 		}
 		cleanupLease(t, l)
 		_, err = client.UpdateItem(t.Context(), &dynamodb.UpdateItemInput{
-			TableName: aws.String(table), Key: key(in.ID),
+			TableName: aws.String(table), Key: Table{Name: "fixture", PartitionKey: "id"}.key(Key{Partition: in.Key.Partition}),
 			UpdateExpression:          aws.String("SET owner_token = :other"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{":other": &types.AttributeValueMemberS{Value: "successor"}},
 		})
@@ -1358,11 +1363,11 @@ func TestLeaseAWS(t *testing.T) {
 		if err := l.Release(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		item, err := getItem(t.Context(), client, table, in.ID)
+		item, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		record, err := parseRecord(item)
+		record, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, item)
 		if err != nil || record.owner != "successor" {
 			t.Fatalf("cleanup cleared the successor token: %v", err)
 		}
@@ -1392,7 +1397,7 @@ func TestLeaseAWS(t *testing.T) {
 				if !errors.Is(err, ErrOutcomeUnknown) {
 					t.Fatalf("lost commit response was not ambiguous: %v", err)
 				}
-				data, err := Read[keyedData](t.Context(), client, table, in.ID)
+				data, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition})
 				if err != nil || data == nil || data.Value != "actually committed" {
 					t.Fatalf("fault was not post-commit: %#v %v", data, err)
 				}
@@ -1403,7 +1408,7 @@ func TestLeaseAWS(t *testing.T) {
 			if injected.Load() != 1 {
 				t.Fatal("fault was not injected")
 			}
-			item, err := getItem(t.Context(), client, table, in.ID)
+			item, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1414,7 +1419,7 @@ func TestLeaseAWS(t *testing.T) {
 	}
 	t.Run("payload decode cleanup", func(t *testing.T) {
 		in := liveInput(table)
-		item, err := MarshalItem(in.ID, map[string]any{"value": map[string]any{"nested": "invalid string"}})
+		item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: in.Key.Partition}, map[string]any{"value": map[string]any{"nested": "invalid string"}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1425,7 +1430,7 @@ func TestLeaseAWS(t *testing.T) {
 		if l != nil || err == nil {
 			t.Fatalf("malformed payload unexpectedly acquired: %v", err)
 		}
-		actual, err := getItem(t.Context(), client, table, in.ID)
+		actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil || !reflect.DeepEqual(actual, maps.Clone(item)) {
 			t.Fatalf("decode cleanup failed to preserve record: %#v %v", actual, err)
 		}

@@ -15,8 +15,8 @@ Each item uses an ownership token and an expiration time to coordinate callers.
 background heartbeat extends the lease while it is held.
 
 `Commit` writes data and releases the lock. `Update` writes without releasing it.
-`Release` releases the lock without changing data. `Read` reads strongly
-consistently without locking, including data published by `Update`.
+`Release` releases the lock without changing data. `Delete` removes the item under
+the live lease. `Read` reads strongly consistently without locking, including data published by `Update`.
 
 Set `Retries` to the number of additional acquisition attempts on contention.
 `RetriesSleep` controls the delay between them and defaults to one second.
@@ -32,8 +32,8 @@ go get github.com/nathants/go-dynamolock
 
 ## Usage
 
-Create a DynamoDB table with a string partition key named `id` and no sort key.
-Pass a configured AWS SDK v2 DynamoDB client:
+Create a DynamoDB table with a string partition key (default name `id`) and an
+optional string sort key. Pass a configured AWS SDK v2 DynamoDB client:
 
 ```go
 package example
@@ -54,8 +54,8 @@ type Data struct {
 
 func update(ctx context.Context, client *dynamodb.Client) (err error) {
 	lease, data, err := dynamolock.Lock[Data](ctx, client, &dynamolock.LockInput{
-		Table:             "table",
-		ID:                "lock1",
+		Table:             dynamolock.Table{Name: "table"},
+		Key:               dynamolock.Key{Partition: "lock1"},
 		HeartbeatMaxAge:   30 * time.Second,
 		HeartbeatInterval: time.Second,
 		Retries:           5,
@@ -79,12 +79,12 @@ func update(ctx context.Context, client *dynamodb.Client) (err error) {
 ```
 
 The deferred `Release` handles early returns and cancellation. It is harmless
-after a successful `Commit`.
+after a successful `Commit` or `Delete`.
 
 ## Data
 
 `T` can be a struct or a string-keyed map, not a pointer type. Map values must
-accept the decoded string ID; `map[string]any` works. If no data has been written,
+accept the decoded string keys; `map[string]any` works. If no data has been written,
 `Lock` and `Read` return nil. An explicitly empty payload returns a non-nil value.
 
 By default, `Lock` creates a missing item. Set `RequireExisting` to reject it with
@@ -92,10 +92,11 @@ By default, `Lock` creates a missing item. Set `RequireExisting` to reject it wi
 `ErrLockNotFound` and `ErrLockHeld` also match `ErrLockUnavailable` with `errors.Is`.
 
 Application fields are stored under `data`, separately from ownership metadata.
-`id` is stored only at the outer level and filled into decoded data. An optional
-string field tagged `dynamodbav:"id"` exposes it in your struct. On writes, an
-empty or missing ID uses the lock key; a conflicting ID is rejected. ID attribute
-names are matched case-insensitively; other application names are unrestricted.
+Primary keys are stored only at the outer level and filled into decoded data.
+Optional string fields tagged with their key names expose them in your struct. On
+writes, empty or missing key fields use the lease key; conflicting values are
+rejected. Key names are matched case-insensitively and cannot overlap each other,
+metadata or configured projections. `lease.Key()` returns both key components.
 
 Struct fields use the SDK's exact-name match first, then its case-insensitive
 match. Updates and deletions address the original stored attribute name, including
@@ -130,10 +131,57 @@ would erase. Changing an existing field's meaning/type, or deleting a field stil
 required by a deployed reader, is not an additive schema change. These payload
 updates do not make unrelated whole-record or opaque JSON writers compatible.
 
-`MarshalItem` encodes new records. Insert them with a conditional `PutItem` using
-`attribute_not_exists(id)` so an existing item is not overwritten. `UnmarshalItem`
-decodes records from scans or streams. All writers to a participating item must
-follow the same lease protocol.
+`MarshalItem(table, key, value)` encodes an unlocked envelope without a write.
+`UnmarshalItem[T](table, item)` decodes complete envelopes, for example from streams.
+Use `Lock` and `Commit` to create/update application documents. All writers to a
+participating item must follow the same lease protocol.
+
+## Keys, indexes and discovery
+
+```go
+table := dynamolock.Table{
+    Name: "jobs", PartitionKey: "pk", SortKey: "sk",
+    Attributes: []string{"pending", "ttl"},
+}
+key := dynamolock.Key{Partition: "account", Sort: "job"}
+value, err := dynamolock.Read[Job](ctx, client, table, key)
+page, err := dynamolock.Query[Job](ctx, client, table, &dynamodb.QueryInput{
+    KeyConditionExpression: aws.String("#pk = :pk"),
+    ExpressionAttributeNames: map[string]string{"#pk": "pk"},
+    ExpressionAttributeValues: map[string]types.AttributeValue{
+        ":pk": &types.AttributeValueMemberS{Value: "account"},
+    },
+})
+```
+
+`Attributes` lists exact top-level payload field names to copy outside `data` for
+secondary indexes or application TTL. They are updated or removed atomically with
+the merged payload, not supplied as a separate authority. Unknown payload fields
+and unconfigured outer attributes survive ordinary writes. Acquisition, renewal
+and release do not change projections. Use omission (`omitempty`) for sparse index
+fields. DynamoDB still enforces index value types and sizes.
+
+Deploy projection-aware writers everywhere before enabling/backfilling an index
+whose fields old writers can change. Preserving an unknown outer attribute is not
+enough to keep its value current. Older versions that reject unknown outer fields
+also need replacement before adding projections. TTL is for disposable application
+records only: deletion is eventual, not expiry enforcement, and can happen while a
+lease is held. Never use lease `expires_at` or active money/resource state for TTL.
+
+`Query` and `Scan` return one `Page[T]`, with `Items`, `Count`, `ScannedCount` and
+the complete `LastEvaluatedKey`. Pass that cursor as `ExclusiveStartKey` for the
+next page, even if this page has no items. SDK filter, index, ordering, consistency
+and limit options are preserved. TableName, if supplied, must match `Table.Name`.
+Partial projections are rejected rather than decoded into misleading complete
+structs; count-only requests are supported. Inputs are copied and not mutated; do
+not mutate them during a call.
+
+Each item has a `Key` and `Value`. An explicitly selected index without projected
+`data` returns nil Value, not an empty document or proof of absence. Use `Read` on
+that key for current data. Base-table discovery retains strict envelope checks.
+An index projecting `data` must project the whole map and either both lease fields
+or neither. Discovery is read-only, may be eventually consistent, and is not a
+collection snapshot. Acquire the actual document before modifying it.
 
 ## Lease lifetime
 
@@ -185,7 +233,7 @@ DYNAMOLOCK_TEST_ACCOUNT="${EXPECTED_ACCOUNT:?}" bash test.sh
 ```
 
 This runs the full suite with the race detector and a twenty-minute timeout.
-By default, live tests create and delete disposable DynamoDB tables. Setting
-`REUSE` to any nonempty value instead clears every item in the dedicated
-`go-dynamolock` test table before and after each test. Never put application data
+By default, live tests create and delete disposable DynamoDB tables. Custom-schema
+tests always use disposable tables. For the default schema, setting `REUSE` to any
+nonempty value instead clears every item in the dedicated `go-dynamolock` test table before and after each test. Never put application data
 there or run reusable-table suites concurrently.

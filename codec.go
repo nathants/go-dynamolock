@@ -18,36 +18,43 @@ var ErrInvalidPayload = errors.New("invalid lock payload")
 // ErrInvalidRecord reports an item that does not use this package's record format.
 var ErrInvalidRecord = errors.New("invalid lock record")
 
-// LockKey is the table's string partition key. No sort key is supported.
-type LockKey struct {
-	ID string `json:"id" dynamodbav:"id"`
-}
-
 // MarshalItem encodes an unlocked envelope without writing to DynamoDB.
-// Use attribute_not_exists(id) when inserting it with PutItem.
-// Nil data and non-map encodings are rejected. A missing or empty data.id uses
-// id; a conflicting or non-string data.id is rejected. Only the outer id is stored.
-func MarshalItem(id string, data any) (map[string]types.AttributeValue, error) {
-	payload, err := marshalPayload(id, data)
+// Nil data, non-map encodings and conflicting keys are rejected. Primary keys
+// are stored only outside data. Does not overwrite or acquire an existing item.
+func MarshalItem(table Table, key Key, data any) (map[string]types.AttributeValue, error) {
+	table, err := table.normalized()
 	if err != nil {
 		return nil, err
 	}
-	item := key(id)
+	payload, err := marshalPayload(table, key, data)
+	if err != nil {
+		return nil, err
+	}
+	item := table.key(key)
 	item["data"] = payload
+	for _, name := range table.Attributes {
+		if value, ok := payload.Value[name]; ok {
+			item[name] = value
+		}
+	}
 	return item, nil
 }
 
-// UnmarshalItem decodes an envelope, or a projection including id and data,
-// into a struct or string-keyed map T. The input map is unchanged.
-// The outer id is injected before decoding, so map values must accept a string.
+// UnmarshalItem decodes a full envelope into a struct or string-keyed map T.
+// The input map is unchanged.
+// Outer primary keys are injected before decoding; map values must accept strings.
 // An absent item or absent data returns nil; empty data returns a non-nil value.
 // Interface numbers use attributevalue.Number to preserve precision; typed
 // numeric fields keep their declared Go types.
-func UnmarshalItem[T any](item map[string]types.AttributeValue) (*T, error) {
+func UnmarshalItem[T any](table Table, item map[string]types.AttributeValue) (*T, error) {
 	if err := validateType[T](); err != nil {
 		return nil, err
 	}
-	r, err := parseRecord(item)
+	table, err := table.normalized()
+	if err != nil {
+		return nil, err
+	}
+	r, err := parseRecord(table, item)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +68,7 @@ func UnmarshalItem[T any](item map[string]types.AttributeValue) (*T, error) {
 	if payload == nil {
 		payload = make(map[string]types.AttributeValue)
 	}
-	payload["id"] = &types.AttributeValueMemberS{Value: r.id}
+	maps.Copy(payload, table.key(r.key))
 	var data T
 	if err := attributevalue.UnmarshalMapWithOptions(payload, &data, func(options *attributevalue.DecoderOptions) {
 		options.UseNumber = true
@@ -79,19 +86,8 @@ func validateType[T any]() error {
 	return fmt.Errorf("%w: T must be a struct or string-keyed map, got %s", ErrInvalidPayload, t)
 }
 
-func validateID(id string) error {
-	if len(id) == 0 || len(id) > 2048 {
-		return errors.New("id must contain 1 to 2048 bytes")
-	}
-	return nil
-}
-
-func key(id string) map[string]types.AttributeValue {
-	return map[string]types.AttributeValue{"id": &types.AttributeValueMemberS{Value: id}}
-}
-
-func marshalPayload(id string, data any) (*types.AttributeValueMemberM, error) {
-	if err := validateID(id); err != nil {
+func marshalPayload(table Table, key Key, data any) (*types.AttributeValueMemberM, error) {
+	if err := table.validateKey(key); err != nil {
 		return nil, err
 	}
 	// The SDK can encode a pointer to a nil map as an empty map. Reject nil
@@ -112,16 +108,20 @@ func marshalPayload(id string, data any) (*types.AttributeValueMemberM, error) {
 		return nil, fmt.Errorf("%w: data must encode as a map, not %T", ErrInvalidPayload, av)
 	}
 	// The SDK also matches struct fields case-insensitively. Validate and
-	// remove every alias so data.ID cannot shadow the injected outer id.
-	// A custom marshaler may return its own map; never remove its id in place.
+	// remove every key alias so it cannot shadow the injected outer identity.
+	// A custom marshaler may return its own map; never remove keys in place.
 	values := maps.Clone(payload.Value)
 	for name, value := range values {
-		if !strings.EqualFold(name, "id") {
+		if !table.isKey(name) {
 			continue
 		}
+		expected := key.Partition
+		if strings.EqualFold(name, table.SortKey) {
+			expected = key.Sort
+		}
 		value, ok := value.(*types.AttributeValueMemberS)
-		if !ok || value == nil || value.Value != "" && value.Value != id {
-			return nil, fmt.Errorf("%w: data.id must be empty or match the lock key", ErrInvalidPayload)
+		if !ok || value == nil || value.Value != "" && value.Value != expected {
+			return nil, fmt.Errorf("%w: data key must be empty or match the lock key", ErrInvalidPayload)
 		}
 		delete(values, name)
 	}
@@ -129,37 +129,40 @@ func marshalPayload(id string, data any) (*types.AttributeValueMemberM, error) {
 }
 
 type record struct {
-	id      string
+	key     Key
 	owner   string
 	expires int64
 	data    *types.AttributeValueMemberM
 }
 
-func parseRecord(item map[string]types.AttributeValue) (record, error) {
+func parseRecord(table Table, item map[string]types.AttributeValue) (record, error) {
 	var r record
 	if len(item) == 0 {
 		return r, nil
 	}
-	for name := range item {
-		switch name {
-		case "id", "owner_token", "expires_at", "data":
-		default:
-			return r, fmt.Errorf("%w: unexpected outer attribute %q", ErrInvalidRecord, name)
+	var err error
+	r.key, err = table.readKey(item)
+	if err != nil {
+		return r, err
+	}
+	// Future projected attributes are allowed only on a real envelope. A flat
+	// legacy row must never be interpreted as an empty application document.
+	if _, hasData := item["data"]; !hasData {
+		for name := range item {
+			if name != table.PartitionKey && (table.SortKey == "" || name != table.SortKey) && name != "owner_token" && name != "expires_at" {
+				return r, fmt.Errorf("%w: unexpected outer attribute %q without data", ErrInvalidRecord, name)
+			}
 		}
 	}
-	id, ok := item["id"].(*types.AttributeValueMemberS)
-	if !ok || id == nil || validateID(id.Value) != nil {
-		return r, fmt.Errorf("%w: missing or invalid id", ErrInvalidRecord)
-	}
-	r.id = id.Value
+	var ok bool
 	if value, exists := item["data"]; exists {
 		r.data, ok = value.(*types.AttributeValueMemberM)
 		if !ok || r.data == nil {
 			return r, fmt.Errorf("%w: data must be a map", ErrInvalidRecord)
 		}
 		for name := range r.data.Value {
-			if strings.EqualFold(name, "id") {
-				return r, fmt.Errorf("%w: id belongs only at the outer level", ErrInvalidRecord)
+			if table.isKey(name) {
+				return r, fmt.Errorf("%w: primary keys belong only at the outer level", ErrInvalidRecord)
 			}
 		}
 	}

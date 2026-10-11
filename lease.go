@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,8 +65,8 @@ func newLease[T any](ctx context.Context, client *dynamodb.Client, in LockInput,
 // Cancellation cannot undo external effects or in-flight DynamoDB requests.
 func (l *Lease[T]) Context() context.Context { return l.ctx }
 
-// ID returns the immutable primary key shared by the lease and its payload.
-func (l *Lease[T]) ID() string { return l.input.ID }
+// Key returns the immutable primary key shared by the lease and its payload.
+func (l *Lease[T]) Key() Key { return l.input.Key }
 
 // Enforce the last confirmed monotonic deadline independently of the heartbeat
 // goroutine, even if a request is stuck in the transport.
@@ -181,7 +182,7 @@ func (l *Lease[T]) renew() error {
 		}
 		attemptCtx, cancelAttempt := context.WithTimeoutCause(ctx, attemptTimeout, errRenewalAttemptTimeout)
 		_, err := l.client.UpdateItem(attemptCtx, &dynamodb.UpdateItemInput{
-			TableName: aws.String(l.input.Table), Key: key(l.input.ID),
+			TableName: aws.String(l.input.Table.Name), Key: l.input.Table.key(l.input.Key),
 			UpdateExpression:         aws.String("SET #expires = :next"),
 			ConditionExpression:      aws.String("#owner = :owner AND #expires > :now AND #expires < :next"),
 			ExpressionAttributeNames: map[string]string{"#owner": "owner_token", "#expires": "expires_at"},
@@ -197,8 +198,8 @@ func (l *Lease[T]) renew() error {
 			return l.confirm(started, expires)
 		}
 		if failure, ok := conditionalFailure(err); ok {
-			r, parseErr := parseRecord(failure.Item)
-			if parseErr == nil && r.id == l.input.ID && r.owner == l.owner && r.expires >= expires {
+			r, parseErr := parseRecord(l.input.Table, failure.Item)
+			if parseErr == nil && r.key == l.input.Key && r.owner == l.owner && r.expires >= expires {
 				// Another delayed renewal already established at least this expiry.
 				return l.confirm(started, expires)
 			}
@@ -310,7 +311,7 @@ func (l *Lease[T]) write(ctx context.Context, data *T, commit bool) error {
 	}
 	// Custom marshaling can outlast the lease and cannot be interrupted here.
 	// Recheck liveness afterward before submitting a write.
-	payload, err := marshalPayload(l.input.ID, data)
+	payload, err := marshalPayload(l.input.Table, l.input.Key, data)
 	if err != nil {
 		return err
 	}
@@ -339,19 +340,13 @@ func (l *Lease[T]) write(ctx context.Context, data *T, commit bool) error {
 		if err := callCtx.Err(); err != nil {
 			return err
 		}
-		update := "SET #data = :data"
-		if commit {
-			update += " REMOVE #owner, #expires"
-		}
+		update, names, values := l.payloadExpression(next, commit)
 		_, err := l.client.UpdateItem(callCtx, &dynamodb.UpdateItemInput{
-			TableName: aws.String(l.input.Table), Key: key(l.input.ID),
-			UpdateExpression:         aws.String(update),
-			ConditionExpression:      aws.String("#owner = :owner AND #expires > :now"),
-			ExpressionAttributeNames: map[string]string{"#owner": "owner_token", "#expires": "expires_at", "#data": "data"},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":owner": &types.AttributeValueMemberS{Value: l.owner},
-				":now":   number(time.Now().UnixNano()), ":data": next,
-			},
+			TableName: aws.String(l.input.Table.Name), Key: l.input.Table.key(l.input.Key),
+			UpdateExpression:          aws.String(update),
+			ConditionExpression:       aws.String("#owner = :owner AND #expires > :now"),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
 		}, noSDKRetry)
 		if err == nil {
 			l.raw, l.visible = next, payload
@@ -401,7 +396,7 @@ func (l *Lease[T]) Release(ctx context.Context) error {
 			return ctx.Err()
 		}
 		_, err := l.client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-			TableName: aws.String(l.input.Table), Key: key(l.input.ID),
+			TableName: aws.String(l.input.Table.Name), Key: l.input.Table.key(l.input.Key),
 			UpdateExpression:          aws.String("REMOVE #owner, #expires"),
 			ConditionExpression:       aws.String("#owner = :owner"),
 			ExpressionAttributeNames:  map[string]string{"#owner": "owner_token", "#expires": "expires_at"},
@@ -425,5 +420,83 @@ func (l *Lease[T]) Release(ctx context.Context) error {
 			l.lose(err)
 		}
 		return err
+	}
+}
+
+// Projections come from the merged stored payload, including fields hidden from T.
+// No second write can expose an index entry inconsistent with its document.
+func (l *Lease[T]) payloadExpression(next *types.AttributeValueMemberM, commit bool) (string, map[string]string, map[string]types.AttributeValue) {
+	names := map[string]string{"#owner": "owner_token", "#expires": "expires_at", "#data": "data"}
+	values := map[string]types.AttributeValue{":owner": &types.AttributeValueMemberS{Value: l.owner}, ":now": number(time.Now().UnixNano()), ":data": next}
+	sets := []string{"#data = :data"}
+	var removes []string
+	if commit {
+		removes = append(removes, "#owner", "#expires")
+	}
+	for i, name := range l.input.Table.Attributes {
+		alias := fmt.Sprintf("#attr%d", i)
+		names[alias] = name
+		if value, ok := next.Value[name]; ok {
+			param := fmt.Sprintf(":attr%d", i)
+			values[param] = value
+			sets = append(sets, alias+" = "+param)
+		} else {
+			removes = append(removes, alias)
+		}
+	}
+	expression := "SET " + strings.Join(sets, ", ")
+	if len(removes) != 0 {
+		expression += " REMOVE " + strings.Join(removes, ", ")
+	}
+	return expression, names, values
+}
+
+// Delete removes the item under the same live-token fence as Update and Commit.
+// An ambiguous response invalidates the handle; reconcile before another action.
+func (l *Lease[T]) Delete(ctx context.Context) error {
+	if err := l.beginOperation(ctx); err != nil {
+		return err
+	}
+	defer func() { <-l.op }()
+	if err := l.liveError(); err != nil {
+		return err
+	}
+	finishing := l.beginFinish()
+	defer l.endFinish(finishing)
+	callCtx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(l.ctx, func() { cancel(context.Cause(l.ctx)) })
+	defer func() { stop(); cancel(nil) }()
+	for attempt := 0; ; attempt++ {
+		if err := l.liveError(); err != nil {
+			return err
+		}
+		if err := callCtx.Err(); err != nil {
+			return err
+		}
+		_, err := l.client.DeleteItem(callCtx, &dynamodb.DeleteItemInput{
+			TableName: aws.String(l.input.Table.Name), Key: l.input.Table.key(l.input.Key),
+			ConditionExpression:       aws.String("#owner = :owner AND #expires > :now"),
+			ExpressionAttributeNames:  map[string]string{"#owner": "owner_token", "#expires": "expires_at"},
+			ExpressionAttributeValues: map[string]types.AttributeValue{":owner": &types.AttributeValueMemberS{Value: l.owner}, ":now": number(time.Now().UnixNano())},
+		}, noSDKRetry)
+		if err == nil {
+			l.complete()
+			return nil
+		}
+		if _, ok := conditionalFailure(err); ok {
+			l.lose(err)
+			return errors.Join(ErrLeaseLost, err)
+		}
+		if !definitelyRejected(err) {
+			err = fmt.Errorf("%w: delete: %w", ErrOutcomeUnknown, err)
+			l.lose(err)
+			return err
+		}
+		if !retryable(err) || attempt+1 >= maxAttempts {
+			return err
+		}
+		if err := backoff(callCtx, attempt); err != nil {
+			return err
+		}
 	}
 }
