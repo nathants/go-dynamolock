@@ -133,6 +133,7 @@ updates do not make unrelated whole-record or opaque JSON writers compatible.
 
 `MarshalItem(table, key, value)` encodes an unlocked envelope without a write.
 `UnmarshalItem[T](table, item)` decodes complete envelopes, for example from streams.
+Codecs need only the key schema; `Table{}` uses `id`. Requests require a table name.
 Use `Lock` and `Commit` to create/update application documents. All writers to a
 participating item must follow the same lease protocol.
 

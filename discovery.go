@@ -31,8 +31,8 @@ func validateDiscovery[T any](ctx context.Context, client *dynamodb.Client, tabl
 	if err != nil {
 		return table, err
 	}
-	if ctx == nil || client == nil {
-		return table, fmt.Errorf("context and DynamoDB client are required")
+	if ctx == nil || client == nil || table.Name == "" {
+		return table, fmt.Errorf("context, DynamoDB client, and table are required")
 	}
 	if err := ctx.Err(); err != nil {
 		return table, err

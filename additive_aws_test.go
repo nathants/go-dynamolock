@@ -23,7 +23,7 @@ func TestLeaseAdditiveAWS(t *testing.T) {
 		"Known": "before", "Remove": "remove intentionally", "future": "retain",
 		"Nested": map[string]any{"KNOWN": "before", "future": "retain nested"},
 	}
-	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, original)
+	item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestLeaseOpaqueListAWS(t *testing.T) {
 		"count":   1,
 		"members": []map[string]any{{"name": "before", "future": "retain"}},
 	}
-	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: input.Key.Partition}, original)
+	item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: input.Key.Partition}, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestLeaseOpaqueListAWS(t *testing.T) {
 		t.Fatal(err)
 	}
 	original["count"] = 2
-	expected, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: input.Key.Partition}, original)
+	expected, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: input.Key.Partition}, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestLeaseEmptyMapAWS(t *testing.T) {
 	if err := lease.Commit(lease.Context(), &value); err != nil {
 		t.Fatal(err)
 	}
-	expected, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: input.Key.Partition}, value)
+	expected, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: input.Key.Partition}, value)
 	if err != nil {
 		t.Fatal(err)
 	}

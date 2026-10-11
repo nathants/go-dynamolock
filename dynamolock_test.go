@@ -501,7 +501,7 @@ type keyedData struct {
 
 func TestEnvelopeIdentityAndReplacement(t *testing.T) {
 	for _, id := range []string{"", "key"} {
-		item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, &keyedData{ID: id, Value: "value"})
+		item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, &keyedData{ID: id, Value: "value"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -509,7 +509,7 @@ func TestEnvelopeIdentityAndReplacement(t *testing.T) {
 		if _, duplicated := payload.Value["id"]; duplicated || len(item) != 2 {
 			t.Fatalf("identity duplicated in stored payload: %#v", item)
 		}
-		data, err := UnmarshalItem[keyedData](Table{Name: "fixture", PartitionKey: "id"}, item)
+		data, err := UnmarshalItem[keyedData](Table{PartitionKey: "id"}, item)
 		if err != nil || data == nil || *data != (keyedData{ID: "key", Value: "value"}) {
 			t.Fatalf("identity round trip: %#v %v", data, err)
 		}
@@ -518,15 +518,15 @@ func TestEnvelopeIdentityAndReplacement(t *testing.T) {
 		}
 	}
 	for _, data := range []any{nil, (*keyedData)(nil), 42, []int{1}, &keyedData{ID: "wrong"}, map[string]any{"id": 42}} {
-		if _, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, data); !errors.Is(err, ErrInvalidPayload) {
+		if _, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, data); !errors.Is(err, ErrInvalidPayload) {
 			t.Errorf("payload %T was not rejected: %v", data, err)
 		}
 	}
-	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{"owner_token": "application", "expires_at": 7})
+	item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{"owner_token": "application", "expires_at": 7})
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := UnmarshalItem[map[string]any](Table{Name: "fixture", PartitionKey: "id"}, item)
+	data, err := UnmarshalItem[map[string]any](Table{PartitionKey: "id"}, item)
 	if err != nil || (*data)["id"] != "key" || (*data)["owner_token"] != "application" {
 		t.Fatalf("nested metadata-name collision: %#v %v", data, err)
 	}
@@ -538,7 +538,7 @@ func TestEnvelopeRejectsNilMaps(t *testing.T) {
 	var named namedMap
 	var pointer *map[string]any
 	for _, payload := range []any{data, &data, named, &named, &pointer} {
-		if _, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, payload); !errors.Is(err, ErrInvalidPayload) {
+		if _, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, payload); !errors.Is(err, ErrInvalidPayload) {
 			t.Errorf("nil payload %T was not rejected: %v", payload, err)
 		}
 	}
@@ -587,21 +587,21 @@ func TestProtocolNilMapWriteDoesNotClearPayload(t *testing.T) {
 func TestEnvelopePreservesInterfaceNumbers(t *testing.T) {
 	const integer = "9007199254740993"
 	const decimal = "0.123456789012345678901234567890"
-	item := Table{Name: "fixture", PartitionKey: "id"}.key(Key{Partition: "key"})
+	item := Table{PartitionKey: "id"}.key(Key{Partition: "key"})
 	item["data"] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
 		"integer": &types.AttributeValueMemberN{Value: integer},
 		"nested": &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{
 			"decimal": &types.AttributeValueMemberN{Value: decimal},
 		}},
 	}}
-	data, err := UnmarshalItem[map[string]any](Table{Name: "fixture", PartitionKey: "id"}, item)
+	data, err := UnmarshalItem[map[string]any](Table{PartitionKey: "id"}, item)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := (*data)["integer"]; got != attributevalue.Number(integer) {
 		t.Errorf("interface number lost precision or type: %T %v", got, got)
 	}
-	encoded, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, data)
+	encoded, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, data)
 	if err != nil || !reflect.DeepEqual(encoded, item) {
 		t.Errorf("unchanged map round-trip changed numbers: %#v %v", encoded, err)
 	}
@@ -612,40 +612,40 @@ func TestEnvelopePreservesInterfaceNumbers(t *testing.T) {
 		Integer int64 `dynamodbav:"integer"`
 		Nested  any   `dynamodbav:"nested"`
 	}
-	typed, err := UnmarshalItem[typedData](Table{Name: "fixture", PartitionKey: "id"}, item)
+	typed, err := UnmarshalItem[typedData](Table{PartitionKey: "id"}, item)
 	if err != nil || typed == nil || typed.Integer != 9007199254740993 {
 		t.Fatalf("typed integer changed: %#v %v", typed, err)
 	}
-	encoded, err = MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, typed)
+	encoded, err = MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, typed)
 	if err != nil || !reflect.DeepEqual(encoded, item) {
 		t.Errorf("struct interface field changed numbers: %#v %v", encoded, err)
 	}
 }
 
 func TestEnvelopeAbsentVersusEmpty(t *testing.T) {
-	for _, item := range []map[string]types.AttributeValue{nil, Table{Name: "fixture", PartitionKey: "id"}.key(Key{Partition: "key"})} {
-		value, err := UnmarshalItem[keyedData](Table{Name: "fixture", PartitionKey: "id"}, item)
+	for _, item := range []map[string]types.AttributeValue{nil, Table{PartitionKey: "id"}.key(Key{Partition: "key"})} {
+		value, err := UnmarshalItem[keyedData](Table{PartitionKey: "id"}, item)
 		if err != nil || value != nil {
 			t.Fatalf("absent payload: %#v %v", value, err)
 		}
 	}
-	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, struct{}{})
+	item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, err := UnmarshalItem[keyedData](Table{Name: "fixture", PartitionKey: "id"}, item)
+	value, err := UnmarshalItem[keyedData](Table{PartitionKey: "id"}, item)
 	if err != nil || value == nil || value.ID != "key" {
 		t.Fatalf("explicitly empty payload: %#v %v", value, err)
 	}
 	for _, field := range []string{"uid", "unix", "legacy-data", ""} {
-		bad := Table{Name: "fixture", PartitionKey: "id"}.key(Key{Partition: "key"})
+		bad := Table{PartitionKey: "id"}.key(Key{Partition: "key"})
 		bad[field] = &types.AttributeValueMemberS{Value: "legacy"}
-		if _, err := UnmarshalItem[keyedData](Table{Name: "fixture", PartitionKey: "id"}, bad); !errors.Is(err, ErrInvalidRecord) {
+		if _, err := UnmarshalItem[keyedData](Table{PartitionKey: "id"}, bad); !errors.Is(err, ErrInvalidRecord) {
 			t.Errorf("legacy %q accepted: %v", field, err)
 		}
 	}
-	item["data"].(*types.AttributeValueMemberM).Value = Table{Name: "fixture", PartitionKey: "id"}.key(Key{Partition: "key"})
-	if _, err := UnmarshalItem[keyedData](Table{Name: "fixture", PartitionKey: "id"}, item); !errors.Is(err, ErrInvalidRecord) {
+	item["data"].(*types.AttributeValueMemberM).Value = Table{PartitionKey: "id"}.key(Key{Partition: "key"})
+	if _, err := UnmarshalItem[keyedData](Table{PartitionKey: "id"}, item); !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("duplicate data.id accepted: %v", err)
 	}
 }
@@ -1325,20 +1325,20 @@ func TestProtocolCanceledCallDoesNotLoseLiveLease(t *testing.T) {
 func TestEnvelopeIdentityCannotBeShadowedByCaseAlias(t *testing.T) {
 	for _, alias := range []string{"ID", "Id", "iD"} {
 		t.Run(alias, func(t *testing.T) {
-			valid, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{alias: "key"})
+			valid, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{alias: "key"})
 			if err != nil {
 				t.Fatal(err)
 			}
-			data, err := UnmarshalItem[keyedData](Table{Name: "fixture", PartitionKey: "id"}, valid)
+			data, err := UnmarshalItem[keyedData](Table{PartitionKey: "id"}, valid)
 			if err != nil || data == nil || data.ID != "key" || len(valid["data"].(*types.AttributeValueMemberM).Value) != 0 {
 				t.Fatalf("matching alias was not normalized to the outer identity: %#v %v", data, err)
 			}
-			if _, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{alias: "other"}); !errors.Is(err, ErrInvalidPayload) {
+			if _, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{alias: "other"}); !errors.Is(err, ErrInvalidPayload) {
 				t.Fatalf("SDK's case-insensitive ID alias bypassed identity validation: %v", err)
 			}
-			item := Table{Name: "fixture", PartitionKey: "id"}.key(Key{Partition: "key"})
+			item := Table{PartitionKey: "id"}.key(Key{Partition: "key"})
 			item["data"] = &types.AttributeValueMemberM{Value: map[string]types.AttributeValue{alias: &types.AttributeValueMemberS{Value: "other"}}}
-			if _, err := UnmarshalItem[keyedData](Table{Name: "fixture", PartitionKey: "id"}, item); !errors.Is(err, ErrInvalidRecord) {
+			if _, err := UnmarshalItem[keyedData](Table{PartitionKey: "id"}, item); !errors.Is(err, ErrInvalidRecord) {
 				t.Fatalf("stored alias could override the injected identity: %v", err)
 			}
 		})

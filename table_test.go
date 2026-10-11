@@ -13,7 +13,7 @@ import (
 )
 
 func TestCompoundEnvelope(t *testing.T) {
-	table := Table{Name: "table", PartitionKey: "pk", SortKey: "sk", Attributes: []string{"pending"}}
+	table := Table{PartitionKey: "pk", SortKey: "sk", Attributes: []string{"pending"}}
 	key := Key{Partition: "account", Sort: "purchase"}
 	type data struct {
 		PK      string
@@ -234,6 +234,9 @@ func TestDiscoveryRejectsPartialAndMalformedBase(t *testing.T) {
 		if _, err := Scan[keyedData](t.Context(), client, table, in); err == nil {
 			t.Fatal("accepted partial/foreign input")
 		}
+	}
+	if _, err := Scan[keyedData](t.Context(), client, Table{}, &dynamodb.ScanInput{}); err == nil {
+		t.Fatal("accepted unnamed table request")
 	}
 	if calls != 0 {
 		t.Fatal("validation reached service")

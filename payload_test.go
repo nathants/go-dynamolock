@@ -34,7 +34,7 @@ func TestProtocolPayloadAliases(t *testing.T) {
 		"Dynamic": map[string]any{"Value": "upper", "value": "lower"},
 		"Members": []any{map[string]any{"VALUE": "member before"}},
 	}
-	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, original)
+	item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, original)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestProtocolPayloadAliases(t *testing.T) {
 	original["Members"] = []any{map[string]any{"value": "member after"}}
 	assertPayload := func() {
 		t.Helper()
-		want, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, original)
+		want, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, original)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -132,7 +132,7 @@ func TestProtocolPayloadCaseDistinctFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, data)
+	want, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, data)
 	if err != nil || !reflect.DeepEqual(payload, want["data"]) {
 		t.Fatalf("case-distinct fields merged: %s, %v", written, err)
 	}
@@ -214,7 +214,7 @@ func TestProtocolEmbeddedPayloadAliases(t *testing.T) {
 	if err := lease.Commit(t.Context(), data); err != nil {
 		t.Fatal(err)
 	}
-	want, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{
+	want, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{
 		"POINTER":   map[string]any{"VALUE": "changed", "future": "retain"},
 		"AMBIGUOUS": map[string]any{"VALUE": "hidden"},
 		"Ignored":   "hidden",
@@ -268,7 +268,7 @@ func TestProtocolCustomCodecKeepsExactKeys(t *testing.T) {
 	if err := lease.Commit(t.Context(), data); err != nil {
 		t.Fatal(err)
 	}
-	want, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{"CUSTOM": map[string]any{"value": "changed"}})
+	want, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "key"}, map[string]any{"CUSTOM": map[string]any{"value": "changed"}})
 	if err != nil || !reflect.DeepEqual(payload, want["data"]) {
 		encoded, _ := attributevalue.MarshalJSON(payload)
 		t.Fatalf("custom codec keys folded: %s, %v", encoded, err)

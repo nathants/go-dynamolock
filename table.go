@@ -11,6 +11,7 @@ import (
 // Table describes string primary keys and optional top-level projections of data
 // fields for indexes or application TTL. PartitionKey defaults to id. Attributes
 // are exact stored field names, not paths; lease metadata must never be TTL.
+// Name is required for requests, but may be omitted for pure envelope codecs.
 type Table struct {
 	Name         string
 	PartitionKey string
@@ -25,9 +26,6 @@ type Key struct {
 }
 
 func (t Table) normalized() (Table, error) {
-	if t.Name == "" {
-		return t, fmt.Errorf("table name is required")
-	}
 	if t.PartitionKey == "" {
 		t.PartitionKey = "id"
 	}

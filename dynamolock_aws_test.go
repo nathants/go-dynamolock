@@ -617,7 +617,7 @@ type preExistingData struct {
 func TestPreExistingData(t *testing.T) {
 	ctx := t.Context()
 	client, table := liveTable(t)
-	item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: "test-id"}, preExistingData{
+	item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: "test-id"}, preExistingData{
 		ID:    "test-id",
 		Value: "test-value",
 	})
@@ -1015,7 +1015,7 @@ func TestLeaseAWS(t *testing.T) {
 	client, table := liveTable(t)
 	t.Run("release preserves raw payload and identity", func(t *testing.T) {
 		in := liveInput(table)
-		item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: in.Key.Partition}, keyedData{Value: "retained"})
+		item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: in.Key.Partition}, keyedData{Value: "retained"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1069,7 +1069,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: in.Key.Partition}, keyedData{Value: "committed"})
+		want, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: in.Key.Partition}, keyedData{Value: "committed"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1205,7 +1205,7 @@ func TestLeaseAWS(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			r, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, before)
+			r, err := parseRecord(Table{PartitionKey: "id"}, before)
 			if err != nil || r.owner != second.owner || r.data == nil {
 				t.Fatalf("successor did not establish ownership and payload: %v", err)
 			}
@@ -1254,8 +1254,8 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		oldRecord, _ := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, before)
-		newRecord, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, after)
+		oldRecord, _ := parseRecord(Table{PartitionKey: "id"}, before)
+		newRecord, err := parseRecord(Table{PartitionKey: "id"}, after)
 		if err != nil || newRecord.expires <= oldRecord.expires {
 			t.Fatalf("expiry did not advance: %d %d %v", oldRecord.expires, newRecord.expires, err)
 		}
@@ -1332,7 +1332,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		record, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, item)
+		record, err := parseRecord(Table{PartitionKey: "id"}, item)
 		if err != nil || stale.Load() >= retried.Load() || record.expires < retried.Load() || l.Context().Err() != nil {
 			t.Fatalf("late renewal shortened the lease: stale=%d retried=%d stored=%d %v %v",
 				stale.Load(), retried.Load(), record.expires, err, context.Cause(l.Context()))
@@ -1349,7 +1349,7 @@ func TestLeaseAWS(t *testing.T) {
 		}
 		cleanupLease(t, l)
 		_, err = client.UpdateItem(t.Context(), &dynamodb.UpdateItemInput{
-			TableName: aws.String(table), Key: Table{Name: "fixture", PartitionKey: "id"}.key(Key{Partition: in.Key.Partition}),
+			TableName: aws.String(table), Key: Table{PartitionKey: "id"}.key(Key{Partition: in.Key.Partition}),
 			UpdateExpression:          aws.String("SET owner_token = :other"),
 			ExpressionAttributeValues: map[string]types.AttributeValue{":other": &types.AttributeValueMemberS{Value: "successor"}},
 		})
@@ -1367,7 +1367,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		record, err := parseRecord(Table{Name: "fixture", PartitionKey: "id"}, item)
+		record, err := parseRecord(Table{PartitionKey: "id"}, item)
 		if err != nil || record.owner != "successor" {
 			t.Fatalf("cleanup cleared the successor token: %v", err)
 		}
@@ -1419,7 +1419,7 @@ func TestLeaseAWS(t *testing.T) {
 	}
 	t.Run("payload decode cleanup", func(t *testing.T) {
 		in := liveInput(table)
-		item, err := MarshalItem(Table{Name: "fixture", PartitionKey: "id"}, Key{Partition: in.Key.Partition}, map[string]any{"value": map[string]any{"nested": "invalid string"}})
+		item, err := MarshalItem(Table{PartitionKey: "id"}, Key{Partition: in.Key.Partition}, map[string]any{"value": map[string]any{"nested": "invalid string"}})
 		if err != nil {
 			t.Fatal(err)
 		}
