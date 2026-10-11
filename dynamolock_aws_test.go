@@ -22,33 +22,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
-
-func liveClient(t *testing.T) *dynamodb.Client {
-	t.Helper()
-	expected := os.Getenv("DYNAMOLOCK_TEST_ACCOUNT")
-	if expected == "" {
-		t.Skip("DYNAMOLOCK_TEST_ACCOUNT is not set; skipping live AWS test")
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if actual := aws.ToString(identity.Account); expected != actual {
-		t.Fatalf("AWS account mismatch: expected %s, got %s", expected, actual)
-	}
-	return dynamodb.NewFromConfig(cfg)
-}
 
 type Data struct {
 	Value string `json:"value" dynamodbav:"value"`
@@ -56,7 +32,7 @@ type Data struct {
 
 func liveTable(t *testing.T) (*dynamodb.Client, string) {
 	t.Helper()
-	client := liveClient(t)
+	client := awsTestClient
 	reuse := os.Getenv("REUSE") != ""
 	table := "test-go-dynamolock-" + Uid()
 	if reuse {
@@ -1091,8 +1067,12 @@ func TestLeaseAWS(t *testing.T) {
 			t.Fatal(err)
 		}
 		want, err := MarshalItem(in.ID, keyedData{Value: "committed"})
-		if err != nil || !reflect.DeepEqual(actual, want) {
-			t.Fatalf("commit failed whole-payload replacement: %#v %v", actual, err)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want["data"].(*types.AttributeValueMemberM).Value["unknown"] = item["data"].(*types.AttributeValueMemberM).Value["unknown"]
+		if !reflect.DeepEqual(actual, want) {
+			t.Fatalf("commit changed unknown payload fields: %#v", actual)
 		}
 	})
 	t.Run("holder expiry and stale handle", func(t *testing.T) {

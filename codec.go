@@ -54,6 +54,9 @@ func UnmarshalItem[T any](item map[string]types.AttributeValue) (*T, error) {
 	if r.data == nil {
 		return nil, nil
 	}
+	if err := validateProjection(r.data, reflect.TypeFor[T]()); err != nil {
+		return nil, err
+	}
 	payload := maps.Clone(r.data.Value)
 	if payload == nil {
 		payload = make(map[string]types.AttributeValue)

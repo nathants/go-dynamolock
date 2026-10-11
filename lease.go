@@ -25,6 +25,11 @@ type Lease[T any] struct {
 	done   chan struct{}
 	op     chan struct{}
 
+	// Protected by op. The raw snapshot keeps fields this T cannot decode;
+	// visible is the last confirmed caller-visible encoding, not a caller alias.
+	raw     *types.AttributeValueMemberM
+	visible *types.AttributeValueMemberM
+
 	mu        sync.Mutex
 	deadline  time.Time // Includes Go's monotonic clock reading.
 	expires   int64     // Absolute Unix nanoseconds stored in DynamoDB.
@@ -281,13 +286,15 @@ func (l *Lease[T]) complete() {
 	<-l.done
 }
 
-// Update replaces the entire payload without extending or releasing the lease.
-// Nil is rejected. Fields omitted by the payload's marshaler are removed.
+// Update patches caller-visible changes without extending or releasing the lease.
+// Unknown map fields survive. Removing a previously visible field removes its
+// subtree; a changed opaque list must not discard fields hidden by typed decoding.
+// Nil is rejected. The last confirmed encoding is the comparison baseline.
 func (l *Lease[T]) Update(ctx context.Context, data *T) error {
 	return l.write(ctx, data, false)
 }
 
-// Commit atomically replaces the payload and releases ownership. Nil is
+// Commit atomically patches caller-visible changes and releases ownership. Nil is
 // rejected. A repeated Commit fails with ErrReleased; it is not a new write.
 func (l *Lease[T]) Commit(ctx context.Context, data *T) error {
 	return l.write(ctx, data, true)
@@ -304,6 +311,14 @@ func (l *Lease[T]) write(ctx context.Context, data *T, commit bool) error {
 	// Custom marshaling can outlast the lease and cannot be interrupted here.
 	// Recheck liveness afterward before submitting a write.
 	payload, err := marshalPayload(l.input.ID, data)
+	if err != nil {
+		return err
+	}
+	payload, err = snapshotPayload(payload)
+	if err != nil {
+		return err
+	}
+	next, err := mergePayload[T](l.raw, l.visible, payload)
 	if err != nil {
 		return err
 	}
@@ -335,10 +350,11 @@ func (l *Lease[T]) write(ctx context.Context, data *T, commit bool) error {
 			ExpressionAttributeNames: map[string]string{"#owner": "owner_token", "#expires": "expires_at", "#data": "data"},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":owner": &types.AttributeValueMemberS{Value: l.owner},
-				":now":   number(time.Now().UnixNano()), ":data": payload,
+				":now":   number(time.Now().UnixNano()), ":data": next,
 			},
 		}, noSDKRetry)
 		if err == nil {
+			l.raw, l.visible = next, payload
 			if commit {
 				l.complete()
 			}

@@ -97,12 +97,38 @@ string field tagged `dynamodbav:"id"` exposes it in your struct. On writes, an
 empty or missing ID uses the lock key; a conflicting ID is rejected. ID attribute
 names are matched case-insensitively; other application names are unrestricted.
 
+Struct fields use the SDK's exact-name match first, then its case-insensitive
+match. Updates and deletions address the original stored attribute name, including
+inside nested structs and typed maps. Ordinary map keys remain case-sensitive.
+Multiple stored attributes resolving to one struct field are rejected with
+`ErrInvalidRecord`, rather than decoding an arbitrary winner.
+
 Numbers decoded into interface values use `attributevalue.Number` to preserve
 precision; explicitly typed numeric fields keep their Go types.
 
-`Update` and `Commit` replace the **whole payload**: omitted fields are removed,
-including fields absent from your Go struct. Both reject nil values, including
-nil maps. Use `Release` when you want to leave the stored data unchanged.
+`Update` and `Commit` merge changes from the value returned by `Lock` (or the
+last successful write) into the original raw payload, then atomically write that
+merged payload under the existing ownership and expiry checks. Map fields absent
+from your Go type survive, including nested map fields. Removing a previously
+visible map key or omitting a previously encoded field removes that subtree.
+Unchanged fields retain their stored representation. Both operations reject nil
+values, including nil maps; an explicit empty map removes only keys visible to
+that map's prior value. Use `Release` to leave all data unchanged.
+
+Lists and scalar values are atomic fields, not collections with inferred identity.
+A changed list that would discard fields hidden by typed decoding is rejected with
+`ErrInvalidPayload`; use a representation retaining the complete element data before
+changing it. No positional merge guesses which record survived an insertion or
+reorder. Custom marshalers run when acquiring existing data as well as on writes;
+they must represent the decoded value deterministically and retain attribute names,
+including case. Custom codecs own their name mapping; the library does not infer
+struct aliases inside them. Unknown-field preservation is not permission to bypass
+the lease protocol with another writer.
+
+Deploy field-preserving writers everywhere before adding fields older binaries
+would erase. Changing an existing field's meaning/type, or deleting a field still
+required by a deployed reader, is not an additive schema change. These payload
+updates do not make unrelated whole-record or opaque JSON writers compatible.
 
 `MarshalItem` encodes new records. Insert them with a conditional `PutItem` using
 `attribute_not_exists(id)` so an existing item is not overwritten. `UnmarshalItem`
@@ -146,3 +172,20 @@ expiration makes the lock available again, not the application data disposable.
 Conditional writes protect this DynamoDB item, not external effects. A paused
 holder can resume after another owner takes over. Operations on other systems
 need their own idempotency or fencing; holding this lease alone is not enough.
+
+## Tests
+
+Tests require working AWS credentials, an AWS region, and an independently known
+scratch-account ID. The test binary verifies that account with STS before running
+any test, including selected protocol tests; missing or invalid setup fails the
+suite rather than skipping AWS coverage.
+
+```sh
+DYNAMOLOCK_TEST_ACCOUNT="${EXPECTED_ACCOUNT:?}" bash test.sh
+```
+
+This runs the full suite with the race detector and a twenty-minute timeout.
+By default, live tests create and delete disposable DynamoDB tables. Setting
+`REUSE` to any nonempty value instead clears every item in the dedicated
+`go-dynamolock` test table before and after each test. Never put application data
+there or run reusable-table suites concurrently.

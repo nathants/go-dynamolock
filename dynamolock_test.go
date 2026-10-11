@@ -32,38 +32,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-func TestUnarmedLiveGateSkipsBeforeProvider(t *testing.T) {
-	const helper = "DYNAMOLOCK_TEST_UNARMED_HELPER"
+func TestSuiteRequiresAWS(t *testing.T) {
+	const helper = "DYNAMOLOCK_TEST_GATE_HELPER"
 	if os.Getenv(helper) == "1" {
-		liveTable(t)
-		return
-	}
-
-	t.Setenv("DYNAMOLOCK_TEST_ACCOUNT", "")
-	t.Setenv("AWS_ACCESS_KEY_ID", "test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
-	t.Setenv("AWS_DEFAULT_REGION", "us-west-2")
-	t.Setenv("AWS_REGION", "us-west-2")
-	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-	t.Setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:1")
-	t.Setenv("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1")
-	t.Setenv("AWS_MAX_ATTEMPTS", "1")
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestUnarmedLiveGateSkipsBeforeProvider$")
-	cmd.Env = append(os.Environ(), helper+"=1")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("unarmed live test reached the provider: %v\n%s", err, output)
-	}
-}
-
-func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
-	const helper = "DYNAMOLOCK_TEST_ARMED_HELPER"
-	if os.Getenv(helper) == "1" {
-		client := liveClient(t)
-		if _, err := client.CreateTable(t.Context(), &dynamodb.CreateTableInput{
-			TableName: aws.String("offline-gate"), BillingMode: types.BillingModePayPerRequest,
+		if _, err := awsTestClient.CreateTable(t.Context(), &dynamodb.CreateTableInput{
+			TableName: aws.String("protocol-gate"), BillingMode: types.BillingModePayPerRequest,
 			AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("id"), AttributeType: types.ScalarAttributeTypeS}},
 			KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("id"), KeyType: types.KeyTypeHash}},
 		}); err != nil {
@@ -72,8 +45,19 @@ func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
 		return
 	}
 
-	for _, expected := range []string{"111111111111", "222222222222"} {
-		t.Run(expected, func(t *testing.T) {
+	for _, tc := range []struct {
+		name, expected, cause string
+		noCredentials, denied bool
+		identities, mutations int32
+	}{
+		{name: "missing account", cause: "DYNAMOLOCK_TEST_ACCOUNT"},
+		{name: "invalid account", expected: "not an account", cause: "DYNAMOLOCK_TEST_ACCOUNT"},
+		{name: "missing credentials", expected: "111111111111", noCredentials: true, cause: "get credentials"},
+		{name: "invalid credentials", expected: "111111111111", denied: true, identities: 1, cause: "InvalidClientTokenId"},
+		{name: "wrong account", expected: "222222222222", identities: 1, cause: "AWS account mismatch"},
+		{name: "verified account", expected: "111111111111", identities: 1, mutations: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			var identityCalls, mutations atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("X-Amz-Target") == "DynamoDB_20120810.CreateTable" {
@@ -95,7 +79,12 @@ func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
 				}
 				identityCalls.Add(1)
 				w.Header().Set("Content-Type", "text/xml")
-				if _, err := io.WriteString(w, `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111111111111</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`); err != nil {
+				body := `<GetCallerIdentityResponse><GetCallerIdentityResult><Account>111111111111</Account></GetCallerIdentityResult></GetCallerIdentityResponse>`
+				if tc.denied {
+					w.WriteHeader(http.StatusForbidden)
+					body = `<ErrorResponse><Error><Code>InvalidClientTokenId</Code><Message>invalid credentials</Message></Error></ErrorResponse>`
+				}
+				if _, err := io.WriteString(w, body); err != nil {
 					t.Error(err)
 				}
 			}))
@@ -103,18 +92,17 @@ func TestArmedLiveGateChecksAccountBeforeMutation(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestArmedLiveGateChecksAccountBeforeMutation$")
-			cmd.Env = append(offlineAWSEnv(server.URL, expected), helper+"=1")
-			output, err := cmd.CombinedOutput()
-			if expected == "111111111111" {
-				if err != nil || mutations.Load() != 1 {
-					t.Fatalf("matching account did not reach DynamoDB: mutations=%d err=%v\n%s", mutations.Load(), err, output)
-				}
-			} else if err == nil || !strings.Contains(string(output), "AWS account mismatch") || mutations.Load() != 0 {
-				t.Fatalf("wrong-account gate failed: mutations=%d err=%v\n%s", mutations.Load(), err, output)
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSuiteRequiresAWS$")
+			cmd.Env = append(offlineAWSEnv(server.URL, tc.expected), helper+"=1")
+			if tc.noCredentials {
+				cmd.Env = append(cmd.Env, "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=")
 			}
-			if identityCalls.Load() != 1 {
-				t.Fatalf("account checks = %d, want 1", identityCalls.Load())
+			output, err := cmd.CombinedOutput()
+			if (err != nil) != (tc.cause != "") || ctx.Err() != nil || !strings.Contains(string(output), tc.cause) {
+				t.Fatalf("suite gate: err = %v, want %q\n%s", err, tc.cause, output)
+			}
+			if mutations.Load() != tc.mutations || identityCalls.Load() != tc.identities {
+				t.Fatalf("account checks = %d, mutations = %d, want %d/%d", identityCalls.Load(), mutations.Load(), tc.identities, tc.mutations)
 			}
 		})
 	}
@@ -136,7 +124,7 @@ func offlineAWSEnv(endpoint, expected string) []string {
 func TestLiveFixtureLifecycle(t *testing.T) {
 	const helper = "DYNAMOLOCK_TEST_FIXTURE_HELPER"
 	if scenario := os.Getenv(helper); scenario != "" {
-		client := liveClient(t)
+		client := awsTestClient
 		setupTable(t, client, "fixture-table", os.Getenv("REUSE") != "")
 		if scenario == "failed_lease" {
 			lease, _, err := Lock[Data](t.Context(), client, &LockInput{

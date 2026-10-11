@@ -9,5 +9,5 @@ command -v libcheck >/dev/null || { echo 'libcheck not found; install it with: g
 libcheck check
 libcheck security
 
-echo 'go test (offline)'
-DYNAMOLOCK_TEST_ACCOUNT= bash test.sh
+echo 'go test (AWS required)'
+bash test.sh

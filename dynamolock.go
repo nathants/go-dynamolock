@@ -128,9 +128,23 @@ func Lock[T any](ctx context.Context, client *dynamodb.Client, input *LockInput)
 	if r.id != in.ID || r.owner != owner || r.expires != started.Add(in.HeartbeatMaxAge).UnixNano() {
 		return nil, nil, fmt.Errorf("%w: acquisition returned unexpected ownership", ErrInvalidRecord)
 	}
+	l.raw, err = snapshotPayload(r.data)
+	if err != nil {
+		return nil, nil, err
+	}
 	data, err = UnmarshalItem[T](item)
 	if err != nil {
 		return nil, nil, err
+	}
+	if data != nil {
+		visible, encodeErr := marshalPayload(in.ID, data)
+		if encodeErr != nil {
+			return nil, nil, encodeErr
+		}
+		l.visible, err = snapshotPayload(visible)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := l.liveError(); err != nil {
 		return nil, nil, err
