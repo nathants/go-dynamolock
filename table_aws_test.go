@@ -46,7 +46,7 @@ func TestTableAWS(t *testing.T) {
 		if err := l.Commit(t.Context(), &job{Value: sort, Pending: "work", TTL: 2000000000}); err != nil {
 			t.Fatal(err)
 		}
-		value, err := Read[job](t.Context(), client, table, key)
+		value, err := Read[job](t.Context(), client, table, key, ReadOptions{ConsistentRead: true})
 		if err != nil || value == nil || value.PK != "account" || value.SK != sort || value.Value != sort {
 			t.Fatalf("read compound: %+v %v", value, err)
 		}

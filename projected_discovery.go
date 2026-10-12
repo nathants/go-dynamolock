@@ -101,12 +101,13 @@ func decodeProjected[T any](table Table, item map[string]types.AttributeValue) (
 	return &ProjectedItem[T]{Key: r.key, Value: value, HasLeaseMetadata: r.owner != ""}, nil
 }
 
-// ReadProjected strongly reads one key with only the requested payload paths.
-// Paths are exact attribute-name segments relative to data, not expressions or
-// list indexes. No fields selects keys/metadata only. A nil result means no item;
-// a nil Value on a present result means no selected payload was returned.
-// No hidden full read, lease, or writer capability is provided.
-func ReadProjected[T any](ctx context.Context, client *dynamodb.Client, table Table, key Key, fields [][]string) (*ProjectedItem[T], error) {
+// ReadProjected reads one key with only the requested payload paths. Reads are
+// eventually consistent unless ConsistentRead is true; eventual reads can return
+// stale data, lease metadata or absence. Paths are exact attribute-name segments
+// relative to data, not expressions or list indexes. No fields selects keys/metadata
+// only. A nil result means no item was observed; a nil Value on a present result
+// means no selected payload was returned. No hidden full read or lease is provided.
+func ReadProjected[T any](ctx context.Context, client *dynamodb.Client, table Table, key Key, fields [][]string, options ReadOptions) (*ProjectedItem[T], error) {
 	var err error
 	table, err = table.normalized()
 	if err != nil {
@@ -122,31 +123,27 @@ func ReadProjected[T any](ctx context.Context, client *dynamodb.Client, table Ta
 	if err != nil {
 		return nil, err
 	}
-	in := &dynamodb.GetItemInput{
-		TableName: aws.String(table.Name), Key: table.key(key), ConsistentRead: aws.Bool(true),
+	raw, err := readItem(ctx, client, &dynamodb.GetItemInput{
+		TableName: aws.String(table.Name), Key: table.key(key),
+		ConsistentRead:       aws.Bool(options.ConsistentRead),
 		ProjectionExpression: aws.String(projection), ExpressionAttributeNames: names,
+	})
+	if err != nil {
+		return nil, err
 	}
-	for attempt := 0; ; attempt++ {
-		out, err := client.GetItem(ctx, in, noSDKRetry)
-		if err == nil {
-			item, err := decodeProjected[T](table, out.Item)
-			if err == nil && item != nil && item.Key != key {
-				return nil, fmt.Errorf("%w: read returned another primary key", ErrInvalidRecord)
-			}
-			return item, err
-		}
-		if !retryable(err) || attempt+1 >= maxAttempts {
-			return nil, err
-		}
-		if err := backoff(ctx, attempt); err != nil {
-			return nil, err
-		}
+	item, err := decodeProjected[T](table, raw)
+	if err == nil && item != nil && item.Key != key {
+		return nil, fmt.Errorf("%w: read returned another primary key", ErrInvalidRecord)
 	}
+	return item, err
 }
 
 // ScanProjected returns one incomplete base-table page, selecting only explicit
 // payload paths plus primary keys and both ownership fields. It preserves filter,
 // consistency, limit, segment and cursor options; caller inputs are not mutated.
+// ConsistentRead defaults to false (eventual); true requests strong reads, not a
+// collection snapshot. Pass LastEvaluatedKey as ExclusiveStartKey until the cursor
+// is empty, including after pages with no items.
 // Index scans and caller projection/Select options are rejected so omitted index
 // metadata cannot masquerade as an unleased item. No hidden reads or leases.
 func ScanProjected[T any](ctx context.Context, client *dynamodb.Client, table Table, input *dynamodb.ScanInput, fields [][]string) (ProjectedPage[T], error) {

@@ -311,7 +311,7 @@ func TestReadModifyWrite(t *testing.T) {
 		}
 	}
 	// Local exclusion is not enough: the stored counter must include every worker.
-	stored, err := Read[counter](ctx, client, Table{Name: table}, Key{Partition: id})
+	stored, err := Read[counter](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil || stored == nil || stored.Count != max {
 		t.Fatalf("persisted counter = %#v, err = %v; want %d", stored, err, max)
 	}
@@ -489,7 +489,7 @@ func TestData(t *testing.T) {
 	} else if data.Value != "asdf" {
 		t.Fatal("data mismatch")
 	}
-	read, err := Read[testData](ctx, client, Table{Name: table}, Key{Partition: id})
+	read, err := Read[testData](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +547,7 @@ func TestLockRequireExisting(t *testing.T) {
 	if errors.Is(err, ErrLockHeld) {
 		t.Fatalf("missing item incorrectly matched ErrLockHeld: %v", err)
 	}
-	data, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	data, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -661,7 +661,7 @@ func TestPreExistingData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := Read[preExistingData](ctx, client, Table{Name: table}, Key{Partition: id})
+	stored, err := Read[preExistingData](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil || stored == nil || stored.ID != id || stored.Value != "test-value" {
 		t.Fatalf("commit did not preserve the pre-existing payload: %#v %v", stored, err)
 	}
@@ -690,7 +690,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -705,7 +705,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -724,7 +724,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -733,7 +733,7 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	} else if read.Value != "bar" {
 		t.Fatal("wrong value")
 	}
-	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: "404"})
+	read, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: "404"}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -834,14 +834,14 @@ func TestContextCancelExpired(t *testing.T) {
 	if err := first.Release(ctx); err != nil {
 		t.Fatal(err)
 	}
-	stored, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	stored, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil || stored == nil || stored.Value != "successor" {
 		t.Fatalf("stale handle changed the successor's payload: %#v %v", stored, err)
 	}
 	if err := second.Commit(second.Context(), &Data{Value: "committed"}); err != nil {
 		t.Fatalf("stale cleanup disturbed successor ownership: %v", err)
 	}
-	stored, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	stored, err = Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil || stored == nil || stored.Value != "committed" {
 		t.Fatalf("successor commit did not persist: %#v %v", stored, err)
 	}
@@ -868,7 +868,7 @@ func TestCommitEmptyData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error committing empty data, got: %v", err)
 	}
-	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -901,7 +901,7 @@ func TestUpdateEmptyData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error updating with empty data, got: %v", err)
 	}
-	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id})
+	read, err := Read[Data](ctx, client, Table{Name: table}, Key{Partition: id}, ReadOptions{ConsistentRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1048,7 +1048,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err := l.Update(t.Context(), data); err != nil {
 			t.Fatal(err)
 		}
-		read, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition})
+		read, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition}, ReadOptions{ConsistentRead: true})
 		if err != nil || read == nil || *read != *data {
 			t.Fatalf("checkpoint not visible while held: %#v %v", read, err)
 		}
@@ -1110,7 +1110,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err := second.Commit(t.Context(), &keyedData{Value: "successor"}); err != nil {
 			t.Fatal(err)
 		}
-		read, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition})
+		read, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition}, ReadOptions{ConsistentRead: true})
 		if err != nil || read == nil || read.Value != "successor" {
 			t.Fatalf("stale cleanup disturbed successor: %#v %v", read, err)
 		}
@@ -1397,7 +1397,7 @@ func TestLeaseAWS(t *testing.T) {
 				if !errors.Is(err, ErrOutcomeUnknown) {
 					t.Fatalf("lost commit response was not ambiguous: %v", err)
 				}
-				data, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition})
+				data, err := Read[keyedData](t.Context(), client, Table{Name: table}, Key{Partition: in.Key.Partition}, ReadOptions{ConsistentRead: true})
 				if err != nil || data == nil || data.Value != "actually committed" {
 					t.Fatalf("fault was not post-commit: %#v %v", data, err)
 				}

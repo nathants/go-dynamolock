@@ -1,8 +1,10 @@
 package dynamolock
 
 import (
+	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -45,17 +47,37 @@ func TestProjectedDiscoveryAWS(t *testing.T) {
 	}
 	fields := [][]string{{"public"}, {"nested", "public"}, {"a.b[0]"}}
 	want := map[string]any{"pk": "account", "sk": "visible", "public": "shown", "nested": map[string]any{"public": "nested shown"}, "a.b[0]": "literal name"}
-	item, err := ReadProjected[map[string]any](t.Context(), client, table, visible, fields)
+	item, err := ReadProjected[map[string]any](t.Context(), client, table, visible, fields, ReadOptions{ConsistentRead: true})
 	if err != nil || item == nil || item.Value == nil || item.HasLeaseMetadata || !reflect.DeepEqual(*item.Value, want) {
 		t.Fatalf("real projected read leaked or lost fields: %+v %v", item, err)
 	}
+	// Eventual reads may initially miss the completed inserts. Check convergence
+	// without assuming a delay or upgrading either request to strong consistency.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	for {
+		full, err := Read[map[string]any](ctx, client, table, visible, ReadOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		partial, err := ReadProjected[map[string]any](ctx, client, table, visible, fields, ReadOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if full != nil && (*full)["secret"] == "never loaded" && partial != nil && partial.Value != nil && !partial.HasLeaseMetadata && reflect.DeepEqual(*partial.Value, want) {
+			break
+		}
+		if err := wait(ctx, 100*time.Millisecond); err != nil {
+			t.Fatalf("eventual reads did not converge: %v", err)
+		}
+	}
 	for _, key := range []Key{visible, hidden, skeleton} {
-		item, err := ReadProjected[map[string]any](t.Context(), client, table, key, nil)
+		item, err := ReadProjected[map[string]any](t.Context(), client, table, key, nil, ReadOptions{ConsistentRead: true})
 		if err != nil || item == nil || item.Key != key || item.Value != nil || item.HasLeaseMetadata != (key == skeleton) {
 			t.Fatalf("real key-only read: %+v %v", item, err)
 		}
 	}
-	missing, err := ReadProjected[map[string]any](t.Context(), client, table, Key{Partition: "account", Sort: "absent"}, fields)
+	missing, err := ReadProjected[map[string]any](t.Context(), client, table, Key{Partition: "account", Sort: "absent"}, fields, ReadOptions{ConsistentRead: true})
 	if err != nil || missing != nil {
 		t.Fatalf("real absent item: %+v %v", missing, err)
 	}

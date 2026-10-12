@@ -10,8 +10,8 @@ import (
 )
 
 // Item is one discovered primary key and its document. Value is nil when no data
-// exists, including a keys-only index projection. Read the key for current state;
-// discovery neither acquires ownership nor proves a document is absent.
+// exists, including a keys-only index projection. Use Read with ConsistentRead
+// for current state; discovery neither acquires ownership nor proves absence.
 type Item[T any] struct {
 	Key   Key
 	Value *T
@@ -71,7 +71,11 @@ func decodePage[T any](table Table, items []map[string]types.AttributeValue, cur
 }
 
 // Query returns one typed page with ordinary SDK query/index/filter options.
+// ConsistentRead defaults to false (eventual); true requests strong reads on
+// tables or local secondary indexes. Global secondary indexes are eventual only.
 // Input is copied, never mutated. No hidden rereads, leases or full collection.
+// Pass LastEvaluatedKey as ExclusiveStartKey until the cursor is empty, even
+// after an empty page. Strong reads do not provide a collection snapshot.
 // Do not request partial projections; indexes without data return nil Values.
 func Query[T any](ctx context.Context, client *dynamodb.Client, table Table, input *dynamodb.QueryInput) (Page[T], error) {
 	if input == nil {
@@ -99,7 +103,7 @@ func Query[T any](ctx context.Context, client *dynamodb.Client, table Table, inp
 }
 
 // Scan returns one typed page with ordinary SDK scan/filter/segment options.
-// It has the same projection and ownership rules as Query.
+// It has the same consistency, pagination, projection and ownership rules as Query.
 func Scan[T any](ctx context.Context, client *dynamodb.Client, table Table, input *dynamodb.ScanInput) (Page[T], error) {
 	if input == nil {
 		return Page[T]{}, fmt.Errorf("nil ScanInput")

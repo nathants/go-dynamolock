@@ -52,16 +52,16 @@ func TestSchemaValidation(t *testing.T) {
 		return 400, rejectedJSON, nil
 	})
 	for _, table := range []Table{{}, {Name: "table", PartitionKey: "data"}, {Name: "table", SortKey: "ID"}, {Name: "table", Attributes: []string{"expires_at"}}, {Name: "table", Attributes: []string{""}}, {Name: "table", Attributes: []string{"x", "X"}}} {
-		if _, err := Read[struct{}](t.Context(), client, table, Key{Partition: "key"}); err == nil {
+		if _, err := Read[struct{}](t.Context(), client, table, Key{Partition: "key"}, ReadOptions{}); err == nil {
 			t.Fatalf("accepted schema %+v", table)
 		}
 	}
 	for _, key := range []Key{{}, {Partition: "key", Sort: "unexpected"}} {
-		if _, err := Read[struct{}](t.Context(), client, Table{Name: "table"}, key); err == nil {
+		if _, err := Read[struct{}](t.Context(), client, Table{Name: "table"}, key, ReadOptions{}); err == nil {
 			t.Fatalf("accepted key %+v", key)
 		}
 	}
-	if _, err := Read[struct{}](t.Context(), client, Table{Name: "table", SortKey: "sk"}, Key{Partition: "key"}); err == nil {
+	if _, err := Read[struct{}](t.Context(), client, Table{Name: "table", SortKey: "sk"}, Key{Partition: "key"}, ReadOptions{}); err == nil {
 		t.Fatal("accepted missing sort value")
 	}
 }
@@ -246,5 +246,45 @@ func TestDiscoveryRejectsPartialAndMalformedBase(t *testing.T) {
 	}
 	if _, err := Query[keyedData](t.Context(), client, table, &dynamodb.QueryInput{}); !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("flat base query accepted: %v", err)
+	}
+}
+
+func TestDiscoveryConsistency(t *testing.T) {
+	for _, operation := range []struct {
+		name   string
+		target string
+		call   func(context.Context, *dynamodb.Client, *bool) error
+	}{
+		{"query", "DynamoDB_20120810.Query", func(ctx context.Context, client *dynamodb.Client, consistent *bool) error {
+			_, err := Query[struct{}](ctx, client, Table{Name: "table"}, &dynamodb.QueryInput{ConsistentRead: consistent})
+			return err
+		}},
+		{"scan", "DynamoDB_20120810.Scan", func(ctx context.Context, client *dynamodb.Client, consistent *bool) error {
+			_, err := Scan[struct{}](ctx, client, Table{Name: "table"}, &dynamodb.ScanInput{ConsistentRead: consistent})
+			return err
+		}},
+		{"projected scan", "DynamoDB_20120810.Scan", func(ctx context.Context, client *dynamodb.Client, consistent *bool) error {
+			_, err := ScanProjected[struct{}](ctx, client, Table{Name: "table"}, &dynamodb.ScanInput{ConsistentRead: consistent}, [][]string{{"public"}})
+			return err
+		}},
+	} {
+		for _, mode := range []struct {
+			name       string
+			consistent *bool
+		}{{"default", nil}, {"eventual", aws.Bool(false)}, {"strong", aws.Bool(true)}} {
+			t.Run(operation.name+"/"+mode.name, func(t *testing.T) {
+				calls := 0
+				client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+					calls++
+					if w.Target != operation.target || w.ConsistentRead != aws.ToBool(mode.consistent) {
+						t.Fatalf("wrong discovery request: %+v", w)
+					}
+					return 200, `{}`, nil
+				})
+				if err := operation.call(t.Context(), client, mode.consistent); err != nil || calls != 1 {
+					t.Fatalf("discovery: calls=%d err=%v", calls, err)
+				}
+			})
+		}
 	}
 }

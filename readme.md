@@ -16,7 +16,8 @@ background heartbeat extends the lease while it is held.
 
 `Commit` writes data and releases the lock. `Update` writes without releasing it.
 `Release` releases the lock without changing data. `Delete` removes the item under
-the live lease. `Read` reads strongly consistently without locking, including data published by `Update`.
+the live lease. `Read` reads without locking, including data published by `Update`.
+Read consistency is configurable; see [Read consistency and cost](#read-consistency-and-cost).
 
 Set `Retries` to the number of additional acquisition attempts on contention.
 `RetriesSleep` controls the delay between them and defaults to one second.
@@ -137,6 +138,84 @@ Codecs need only the key schema; `Table{}` uses `id`. Requests require a table n
 Use `Lock` and `Commit` to create/update application documents. All writers to a
 participating item must follow the same lease protocol.
 
+## Read consistency and cost
+
+All non-locking reads default to **eventually consistent (weak) reads**. They may
+return an older value, miss a recent creation, or still return a deleted item.
+Choose them for stale-tolerant listings and background discovery. Strong reads
+reflect writes completed before the read; use them when read-after-write freshness
+matters. Neither mode acquires ownership or prevents a later concurrent change.
+
+| API | Default | Opt into strong reads |
+| --- | --- | --- |
+| `Read`, `ReadProjected` | Eventual with `ReadOptions{}` | `ReadOptions{ConsistentRead: true}` |
+| `Query`, `Scan`, `ScanProjected` | Eventual when SDK `ConsistentRead` is nil or false | `ConsistentRead: aws.Bool(true)` |
+| `Lock` | Atomic conditional acquisition and payload read | Always; no weak mode |
+
+`Lock` uses a conditional write, not a separately configurable read. Its internal
+reconciliation read always remains strong. Before modifying a document, acquire
+it and work from the value returned by `Lock`, not a previous discovery result.
+Even strong scans and queries are not collection-wide or multi-page snapshots.
+Global secondary indexes (GSIs) support only eventual reads; base tables and local
+secondary indexes support either mode. `ScanProjected` is base-table only.
+
+AWS charges eventual reads **half the read units** of strong reads for the same
+operation. A single-item read up to 4 KB consumes 0.5 units eventual versus 1 unit
+strong; larger single-item reads round up in 4 KB increments. This halves the
+on-demand read-request cost or provisioned read-capacity consumption, not the
+whole bill or an already-provisioned capacity charge. Writes, indexes and storage
+have their own costs; `Lock` acquisition is billed as a write.
+
+Selecting fewer fields with a projection reduces returned data and decoding work,
+**not read-unit consumption**. Filters also do not make evaluated items free: a
+scan that returns no matches can still consume capacity and need another page.
+See AWS's [read consistency](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html),
+[read-unit accounting](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/read-write-operations.html)
+and [projection accounting](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ProjectionExpressions.html).
+
+### Single-item reads
+
+Pass a final `ReadOptions` argument to both APIs. When migrating a caller that
+relied on the previous always-strong behavior, pass `ConsistentRead: true`.
+The following snippets assume `ctx` and a configured DynamoDB `client`, inside a
+function returning `error`; `fmt` is used only to display results.
+
+```go
+type Job struct {
+    Public string `dynamodbav:"public"`
+    Secret string `dynamodbav:"secret"`
+}
+table := dynamolock.Table{Name: "jobs", PartitionKey: "pk", SortKey: "sk"}
+key := dynamolock.Key{Partition: "account", Sort: "job"}
+
+// Default: cheaper, potentially stale full-payload read.
+value, err := dynamolock.Read[Job](ctx, client, table, key, dynamolock.ReadOptions{})
+if err != nil {
+    return err
+}
+fmt.Println(value)
+
+// Opt in when freshness matters.
+value, err = dynamolock.Read[Job](ctx, client, table, key,
+    dynamolock.ReadOptions{ConsistentRead: true})
+if err != nil {
+    return err
+}
+fmt.Println(value)
+
+// Fetch only data.public plus keys and lease metadata; eventual by default.
+item, err := dynamolock.ReadProjected[Job](ctx, client, table, key,
+    [][]string{{"public"}}, dynamolock.ReadOptions{})
+if err != nil {
+    return err
+}
+fmt.Println(item) // Secret was not fetched; this is an incomplete observation.
+```
+
+`ReadProjected` accepts the same `ReadOptions{ConsistentRead: true}` for a strong
+partial read. A nil result from an eventual read is not proof of current absence;
+there is no automatic strong reread when data is missing or stale.
+
 ## Keys, indexes and discovery
 
 ```go
@@ -144,15 +223,6 @@ table := dynamolock.Table{
     Name: "jobs", PartitionKey: "pk", SortKey: "sk",
     Attributes: []string{"pending", "ttl"},
 }
-key := dynamolock.Key{Partition: "account", Sort: "job"}
-value, err := dynamolock.Read[Job](ctx, client, table, key)
-page, err := dynamolock.Query[Job](ctx, client, table, &dynamodb.QueryInput{
-    KeyConditionExpression: aws.String("#pk = :pk"),
-    ExpressionAttributeNames: map[string]string{"#pk": "pk"},
-    ExpressionAttributeValues: map[string]types.AttributeValue{
-        ":pk": &types.AttributeValueMemberS{Value: "account"},
-    },
-})
 ```
 
 `Attributes` lists exact top-level payload field names to copy outside `data` for
@@ -178,8 +248,9 @@ structs; count-only requests are supported. Inputs are copied and not mutated; d
 not mutate them during a call.
 
 Each item has a `Key` and `Value`. An explicitly selected index without projected
-`data` returns nil Value, not an empty document or proof of absence. Use `Read` on
-that key for current data. Base-table discovery retains strict envelope checks.
+`data` returns nil Value, not an empty document or proof of absence. Use `Read`
+with `ReadOptions{ConsistentRead: true}` on that key for current data. Base-table
+discovery retains strict envelope checks.
 An index projecting `data` must project the whole map and either both lease fields
 or neither. Discovery is read-only, may be eventually consistent, and is not a
 collection snapshot. Acquire the actual document before modifying it.
@@ -193,15 +264,101 @@ The request includes primary keys, both lease fields and only the selected data.
 It never fetches the complete document or silently rereads it.
 
 These APIs return distinct `ProjectedItem[T]` / `ProjectedPage[T]` types to mark
-incomplete observations. `ReadProjected` is strongly consistent; a nil item means
-absence. A present item with nil `Value` returned none of the selected data, not
-proof the full payload is absent or valid. `HasLeaseMetadata` reports a valid
-owner/expiry pair even if expired, never ownership or live-lease authority.
+incomplete observations. A nil `ReadProjected` item means no item was observed;
+with eventual consistency this can be stale. A present item with nil `Value`
+returned none of the selected data, not proof the full payload is absent or valid.
+`HasLeaseMetadata` reports a valid owner/expiry pair in the observed version, even
+if expired or stale, never ownership or live-lease authority.
 Malformed returned metadata and payload are errors. `ScanProjected` is base-table
 only, preserves SDK filter, consistency, limit, segment and continuation options,
 and clones expression aliases. Caller projection and `Select` options are rejected;
 indexes might omit lease metadata. The full-object APIs retain their strict
 projection/envelope checks. Acquire the complete owner before any mutation.
+
+### Pagination examples
+
+`Query`, `Scan`, and `ScanProjected` each make one logical page request (with
+bounded retries on transient failures), not a request for the whole collection.
+DynamoDB can stop a page at its 1 MB read limit or your `Limit`; `Limit` counts
+items evaluated **before filtering**, not matches returned. `Count` is the number
+of matches in that page; `ScannedCount` is the number evaluated before filtering.
+
+Continue until `len(page.LastEvaluatedKey) == 0`, **not** until `Items` or `Count`
+is zero. Copy the entire cursor into the next input's `ExclusiveStartKey`; index
+cursors can contain extra attributes, so do not rebuild them from `Item.Key`.
+Keep the query/filter/index/consistency settings unchanged while paging. Parallel
+scans need a separate cursor for each segment. Concurrent writes mean pages do
+not form a snapshot, even with strong consistency.
+
+Using the `Job` and compound-key `table` above, query one account with strong
+reads (omit `ConsistentRead`, or set it to false, for half-cost eventual reads):
+
+```go
+query := &dynamodb.QueryInput{
+    ConsistentRead: aws.Bool(true),
+    Limit: aws.Int32(100),
+    KeyConditionExpression: aws.String("#pk = :pk"),
+    ExpressionAttributeNames: map[string]string{"#pk": "pk"},
+    ExpressionAttributeValues: map[string]types.AttributeValue{
+        ":pk": &types.AttributeValueMemberS{Value: "account"},
+    },
+}
+for {
+    page, err := dynamolock.Query[Job](ctx, client, table, query)
+    if err != nil {
+        return err
+    }
+    for _, item := range page.Items {
+        fmt.Println(item.Key, item.Value) // Value can be nil; see index rules above.
+    }
+    if len(page.LastEvaluatedKey) == 0 {
+        break
+    }
+    query.ExclusiveStartKey = page.LastEvaluatedKey
+}
+```
+
+Scan a table with eventual reads. Set `ConsistentRead: aws.Bool(true)` to opt into
+strong reads instead:
+
+```go
+scan := &dynamodb.ScanInput{ConsistentRead: aws.Bool(false), Limit: aws.Int32(100)}
+for {
+    page, err := dynamolock.Scan[Job](ctx, client, table, scan)
+    if err != nil {
+        return err
+    }
+    for _, item := range page.Items {
+        fmt.Println(item.Key, item.Value)
+    }
+    if len(page.LastEvaluatedKey) == 0 {
+        break
+    }
+    scan.ExclusiveStartKey = page.LastEvaluatedKey
+}
+```
+
+A projected scan uses the same cursor pattern and SDK consistency option, but
+returns explicitly incomplete observations and never loads unselected payload
+fields. This example defaults to eventual reads:
+
+```go
+projected := &dynamodb.ScanInput{Limit: aws.Int32(100)}
+fields := [][]string{{"public"}}
+for {
+    page, err := dynamolock.ScanProjected[Job](ctx, client, table, projected, fields)
+    if err != nil {
+        return err
+    }
+    for _, item := range page.Items {
+        fmt.Println(item.Key, item.Value, item.HasLeaseMetadata)
+    }
+    if len(page.LastEvaluatedKey) == 0 {
+        break
+    }
+    projected.ExclusiveStartKey = page.LastEvaluatedKey
+}
+```
 
 ## Lease lifetime
 

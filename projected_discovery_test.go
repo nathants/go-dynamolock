@@ -3,6 +3,7 @@ package dynamolock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"reflect"
 	"slices"
@@ -33,28 +34,35 @@ func projectedWirePaths(t *testing.T, w wireRequest) [][]string {
 }
 
 func TestReadProjectedWire(t *testing.T) {
-	table := Table{Name: "table", PartitionKey: "pk", SortKey: "sk"}
-	key := Key{Partition: "account", Sort: "job"}
-	fields := [][]string{{"public"}, {"nested", "a.b[0]"}}
-	calls := 0
-	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
-		calls++
-		if w.Target != "DynamoDB_20120810.GetItem" || !w.ConsistentRead || w.TableName != table.Name || len(w.Key) != 2 {
-			t.Fatalf("wrong read request: %+v", w)
-		}
-		want := [][]string{{"pk"}, {"sk"}, {"owner_token"}, {"expires_at"}, {"data", "public"}, {"data", "nested", "a.b[0]"}}
-		if got := projectedWirePaths(t, w); !reflect.DeepEqual(got, want) {
-			t.Fatalf("loaded wrong fields: %v", got)
-		}
-		return 200, `{"Item":{"pk":{"S":"account"},"sk":{"S":"job"},"owner_token":{"S":"expired"},"expires_at":{"N":"1"},"data":{"M":{"public":{"S":"visible"},"nested":{"M":{"a.b[0]":{"S":"exact"}}}}}}}`, nil
-	})
-	item, err := ReadProjected[map[string]any](t.Context(), client, table, key, fields)
-	if err != nil || item == nil || item.Value == nil || item.Key != key || !item.HasLeaseMetadata {
-		t.Fatalf("projected read: %+v %v", item, err)
-	}
-	want := map[string]any{"pk": "account", "sk": "job", "public": "visible", "nested": map[string]any{"a.b[0]": "exact"}}
-	if !reflect.DeepEqual(*item.Value, want) || calls != 1 {
-		t.Fatalf("incomplete result or hidden request: %#v calls=%d", *item.Value, calls)
+	for _, consistent := range []bool{false, true} {
+		t.Run(fmt.Sprint("consistent=", consistent), func(t *testing.T) {
+			table := Table{Name: "table", PartitionKey: "pk", SortKey: "sk"}
+			key := Key{Partition: "account", Sort: "job"}
+			fields := [][]string{{"public"}, {"nested", "a.b[0]"}}
+			calls := 0
+			client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+				calls++
+				if w.Target != "DynamoDB_20120810.GetItem" || w.ConsistentRead != consistent || w.TableName != table.Name || len(w.Key) != 2 {
+					t.Fatalf("wrong read request: %+v", w)
+				}
+				want := [][]string{{"pk"}, {"sk"}, {"owner_token"}, {"expires_at"}, {"data", "public"}, {"data", "nested", "a.b[0]"}}
+				if got := projectedWirePaths(t, w); !reflect.DeepEqual(got, want) {
+					t.Fatalf("loaded wrong fields: %v", got)
+				}
+				if calls == 1 {
+					return 500, serverErrorJSON, nil
+				}
+				return 200, `{"Item":{"pk":{"S":"account"},"sk":{"S":"job"},"owner_token":{"S":"expired"},"expires_at":{"N":"1"},"data":{"M":{"public":{"S":"visible"},"nested":{"M":{"a.b[0]":{"S":"exact"}}}}}}}`, nil
+			})
+			item, err := ReadProjected[map[string]any](t.Context(), client, table, key, fields, ReadOptions{ConsistentRead: consistent})
+			if err != nil || item == nil || item.Value == nil || item.Key != key || !item.HasLeaseMetadata {
+				t.Fatalf("projected read: %+v %v", item, err)
+			}
+			want := map[string]any{"pk": "account", "sk": "job", "public": "visible", "nested": map[string]any{"a.b[0]": "exact"}}
+			if !reflect.DeepEqual(*item.Value, want) || calls != 2 {
+				t.Fatalf("incomplete result or hidden request: %#v calls=%d", *item.Value, calls)
+			}
+		})
 	}
 }
 
@@ -92,7 +100,7 @@ func TestReadProjectedAbsentSelectedAndMalformed(t *testing.T) {
 			type public struct {
 				Public string `dynamodbav:"public"`
 			}
-			item, err := ReadProjected[public](t.Context(), client, Table{Name: "table"}, Key{Partition: "key"}, tc.fields)
+			item, err := ReadProjected[public](t.Context(), client, Table{Name: "table"}, Key{Partition: "key"}, tc.fields, ReadOptions{})
 			if tc.invalid {
 				if !errors.Is(err, ErrInvalidRecord) {
 					t.Fatalf("malformed projected item accepted: %+v %v", item, err)
@@ -160,7 +168,7 @@ func TestProjectedValidationBeforeRequest(t *testing.T) {
 	})
 	table := Table{Name: "table"}
 	for _, fields := range [][][]string{{{}}, {{""}}, {{"nested", ""}}, {{"public"}, {"public"}}, {{"nested"}, {"nested", "secret"}}, {{"nested", "public"}, {"nested"}}, {{"ID"}}} {
-		if _, err := ReadProjected[Data](t.Context(), client, table, Key{Partition: "key"}, fields); err == nil {
+		if _, err := ReadProjected[Data](t.Context(), client, table, Key{Partition: "key"}, fields, ReadOptions{}); err == nil {
 			t.Errorf("accepted invalid read paths: %v", fields)
 		}
 		if _, err := ScanProjected[Data](t.Context(), client, table, &dynamodb.ScanInput{}, fields); err == nil {

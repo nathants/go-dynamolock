@@ -46,7 +46,7 @@ func TestLeaseAdditiveAWS(t *testing.T) {
 	}
 	check := func(expected map[string]any) {
 		t.Helper()
-		actual, err := Read[map[string]any](t.Context(), client, Table{Name: table}, Key{Partition: "key"})
+		actual, err := Read[map[string]any](t.Context(), client, Table{Name: table}, Key{Partition: "key"}, ReadOptions{ConsistentRead: true})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -56,9 +56,20 @@ type LockInput struct {
 	RetriesSleep      time.Duration // Zero uses one second.
 }
 
-// Read performs a strongly consistent payload read without taking a lease.
-// It can observe Update before Commit or Release.
-func Read[T any](ctx context.Context, client *dynamodb.Client, table Table, key Key) (*T, error) {
+// ReadOptions controls non-locking single-item reads. The zero value requests
+// eventual consistency, at half the read-unit cost of strong consistency.
+// These options never affect acquisition or its strongly consistent reconciliation.
+type ReadOptions struct {
+	// ConsistentRead requests strong consistency. Otherwise recent creates,
+	// updates and deletes may not yet be visible.
+	ConsistentRead bool
+}
+
+// Read reads a payload without taking a lease. Reads are eventually consistent
+// unless ConsistentRead is true; eventual reads can return stale data or absence.
+// It can observe Update before Commit or Release. Nil means no payload was
+// returned, not necessarily that the item is absent.
+func Read[T any](ctx context.Context, client *dynamodb.Client, table Table, key Key, options ReadOptions) (*T, error) {
 	var err error
 	table, err = table.normalized()
 	if err != nil {
@@ -70,7 +81,10 @@ func Read[T any](ctx context.Context, client *dynamodb.Client, table Table, key 
 	if err := validateType[T](); err != nil {
 		return nil, err
 	}
-	item, err := getItem(ctx, client, table, key)
+	item, err := readItem(ctx, client, &dynamodb.GetItemInput{
+		TableName: aws.String(table.Name), Key: table.key(key),
+		ConsistentRead: aws.Bool(options.ConsistentRead),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -337,11 +351,17 @@ func backoff(ctx context.Context, attempt int) error {
 	return wait(ctx, ceiling/2+time.Duration(mathrand.Int64N(int64(ceiling/2))))
 }
 
+// Acquisition reconciliation always reads strongly, independently of the
+// options exposed by the non-locking read APIs.
 func getItem(ctx context.Context, client *dynamodb.Client, table Table, key Key) (map[string]types.AttributeValue, error) {
+	return readItem(ctx, client, &dynamodb.GetItemInput{
+		TableName: aws.String(table.Name), Key: table.key(key), ConsistentRead: aws.Bool(true),
+	})
+}
+
+func readItem(ctx context.Context, client *dynamodb.Client, input *dynamodb.GetItemInput) (map[string]types.AttributeValue, error) {
 	for attempt := 0; ; attempt++ {
-		output, err := client.GetItem(ctx, &dynamodb.GetItemInput{
-			TableName: aws.String(table.Name), Key: table.key(key), ConsistentRead: aws.Bool(true),
-		}, noSDKRetry)
+		output, err := client.GetItem(ctx, input, noSDKRetry)
 		if err == nil {
 			return output.Item, nil
 		}

@@ -1169,16 +1169,25 @@ func TestProtocolValidationDoesNotCallAWS(t *testing.T) {
 	}
 }
 
-func TestProtocolReadUnwrapsIdentity(t *testing.T) {
-	client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
-		if w.Target != "DynamoDB_20120810.GetItem" || !w.ConsistentRead {
-			return 0, nil, errors.New("Read must be a strong GetItem")
-		}
-		return 200, `{"Item":{"id":{"S":"key"},"data":{"M":{"value":{"S":"read"}}}}}`, nil
-	})
-	data, err := Read[keyedData](t.Context(), client, Table{Name: "table"}, Key{Partition: "key"})
-	if err != nil || !reflect.DeepEqual(data, &keyedData{ID: "key", Value: "read"}) {
-		t.Fatalf("Read: %#v %v", data, err)
+func TestProtocolReadConsistencyAndRetries(t *testing.T) {
+	for _, consistent := range []bool{false, true} {
+		t.Run(fmt.Sprint("consistent=", consistent), func(t *testing.T) {
+			calls := 0
+			client := protocolClient(func(_ context.Context, w wireRequest) (int, any, error) {
+				calls++
+				if w.Target != "DynamoDB_20120810.GetItem" || w.ConsistentRead != consistent || w.TableName != "table" || string(w.Key["id"]) != `{"S":"key"}` || w.ProjectionExpression != "" {
+					t.Fatalf("wrong read request: %+v", w)
+				}
+				if calls == 1 {
+					return 500, serverErrorJSON, nil
+				}
+				return 200, `{"Item":{"id":{"S":"key"},"data":{"M":{"value":{"S":"read"}}}}}`, nil
+			})
+			data, err := Read[keyedData](t.Context(), client, Table{Name: "table"}, Key{Partition: "key"}, ReadOptions{ConsistentRead: consistent})
+			if err != nil || !reflect.DeepEqual(data, &keyedData{ID: "key", Value: "read"}) || calls != 2 {
+				t.Fatalf("Read: %#v %v calls=%d", data, err, calls)
+			}
+		})
 	}
 }
 

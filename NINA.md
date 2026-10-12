@@ -43,6 +43,8 @@ guidance here and implementation rationale beside the relevant code.
   payload and is conditional only on this handle's token, even after loss.
 - `Delete` uses the live ownership/expiry fence, joins renewal on success and
   loses the handle on an ambiguous result. It never blindly retries ambiguity.
+- Non-locking reads default to eventual consistency; callers opt into strong
+  reads. Read options never affect acquisition or its strong reconciliation read.
 - Query/Scan return one page, preserve full service cursors, never take leases or
   silently reread. Reject partial projections. Only explicit index discovery may
   return a key with nil Value despite unknown outer fields and missing data; base
