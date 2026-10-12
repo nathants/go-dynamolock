@@ -149,7 +149,7 @@ matters. Neither mode acquires ownership or prevents a later concurrent change.
 | API | Default | Opt into strong reads |
 | --- | --- | --- |
 | `Read`, `ReadProjected` | Eventual with `ReadOptions{}` | `ReadOptions{ConsistentRead: true}` |
-| `Query`, `Scan`, `ScanProjected` | Eventual when SDK `ConsistentRead` is nil or false | `ConsistentRead: aws.Bool(true)` |
+| `Query`, `QueryIndex`, `Scan`, `ScanProjected` | Eventual when SDK `ConsistentRead` is nil or false | `ConsistentRead: aws.Bool(true)` |
 | `Lock` | Atomic conditional acquisition and payload read | Always; no weak mode |
 
 `Lock` uses a conditional write, not a separately configurable read. Its internal
@@ -255,6 +255,56 @@ An index projecting `data` must project the whole map and either both lease fiel
 or neither. Discovery is read-only, may be eventually consistent, and is not a
 collection snapshot. Acquire the actual document before modifying it.
 
+### Typed index entries
+
+Use `QueryIndex[T]` to decode index entries rather than documents. It returns one
+`IndexPage[T]` with `IndexItem[T]` entries (`Key` and `Value T`), counts and the
+complete service cursor. Every entry has a value decoded only from primary keys
+and the exact configured `Table.Attributes` copies present in the index. A small
+struct containing the expected index fields makes the incomplete value explicit:
+
+```go
+type WaitingEntry struct {
+    WaitingOrder string `dynamodbav:"waiting_order"`
+}
+queues := dynamolock.Table{
+    Name: "queues", Attributes: []string{"waiting", "waiting_order"},
+}
+page, err := dynamolock.QueryIndex[WaitingEntry](ctx, client, queues, &dynamodb.QueryInput{
+    IndexName: aws.String("waiting"), Limit: aws.Int32(100),
+    KeyConditionExpression: aws.String("#waiting = :waiting"),
+    ExpressionAttributeNames: map[string]string{"#waiting": "waiting"},
+    ExpressionAttributeValues: map[string]types.AttributeValue{
+        ":waiting": &types.AttributeValueMemberS{Value: "yes"},
+    },
+})
+if err != nil {
+    return err
+}
+for _, entry := range page.Items {
+    fmt.Println(entry.Key.Partition, entry.Value.WaitingOrder)
+}
+// Pass page.LastEvaluatedKey as ExclusiveStartKey for the next page.
+```
+
+The index must project the desired copies: `KEYS_ONLY` includes index and table
+keys, not every configured attribute. `INCLUDE` and `ALL` work with the same
+semantics. `data`, lease metadata and unconfigured outer attributes are ignored,
+not interpreted or validated as a document. An `ALL` index still returns those
+attributes over the wire; this API is not a field-level privacy boundary.
+Missing copies do not prove that fields are absent from the current document.
+
+`IndexName` is required. Caller projections and `SelectAllAttributes` are rejected
+to prevent parent-table fetching on local indexes. `Select` may be omitted,
+`SelectAllProjectedAttributes`, or `SelectCount`. Filters must reference attributes
+projected into the index. Filters, ordering, limits, consistency and cursors are
+preserved, and inputs are not mutated. Reads default to eventual; only LSIs
+support strong reads. There are no automatic document reads or leases. For queue
+processing, lock `entry.Key` and recheck eligibility using the acquired value,
+not the potentially stale index observation.
+
+### Partial document reads
+
 For read-only paths that must not load private fields, use `ReadProjected[T]` or
 `ScanProjected[T]` with explicit payload paths such as `[][]string{{"public"},
 {"nested", "status"}}`. Each segment is an exact stored attribute name, not a
@@ -277,11 +327,12 @@ projection/envelope checks. Acquire the complete owner before any mutation.
 
 ### Pagination examples
 
-`Query`, `Scan`, and `ScanProjected` each make one logical page request (with
-bounded retries on transient failures), not a request for the whole collection.
-DynamoDB can stop a page at its 1 MB read limit or your `Limit`; `Limit` counts
-items evaluated **before filtering**, not matches returned. `Count` is the number
-of matches in that page; `ScannedCount` is the number evaluated before filtering.
+`Query`, `QueryIndex`, `Scan`, and `ScanProjected` each make one logical page
+request (with bounded retries on transient failures), not a request for the
+whole collection. DynamoDB can stop a page at its 1 MB read limit or your `Limit`;
+`Limit` counts items evaluated **before filtering**, not matches returned. `Count`
+is the number of matches in that page; `ScannedCount` is the number evaluated
+before filtering.
 
 Continue until `len(page.LastEvaluatedKey) == 0`, **not** until `Items` or `Count`
 is zero. Copy the entire cursor into the next input's `ExclusiveStartKey`; index

@@ -61,14 +61,20 @@ func UnmarshalItem[T any](table Table, item map[string]types.AttributeValue) (*T
 	if r.data == nil {
 		return nil, nil
 	}
-	if err := validateProjection(r.data, reflect.TypeFor[T]()); err != nil {
+	return unmarshalPayload[T](table, r.key, r.data)
+}
+
+// unmarshalPayload decodes known payload fields with the outer identity. Callers
+// validate the schema, type and key, and decide which fields are authoritative.
+func unmarshalPayload[T any](table Table, key Key, fields *types.AttributeValueMemberM) (*T, error) {
+	if err := validateProjection(fields, reflect.TypeFor[T]()); err != nil {
 		return nil, err
 	}
-	payload := maps.Clone(r.data.Value)
+	payload := maps.Clone(fields.Value)
 	if payload == nil {
 		payload = make(map[string]types.AttributeValue)
 	}
-	maps.Copy(payload, table.key(r.key))
+	maps.Copy(payload, table.key(key))
 	var data T
 	if err := attributevalue.UnmarshalMapWithOptions(payload, &data, func(options *attributevalue.DecoderOptions) {
 		options.UseNumber = true

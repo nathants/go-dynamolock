@@ -373,6 +373,7 @@ type wireRequest struct {
 	Segment                             int32
 	TotalSegments                       int32
 	IndexName                           string
+	ScanIndexForward                    *bool
 	Select                              string
 	Limit                               int32
 	KeyConditionExpression              string

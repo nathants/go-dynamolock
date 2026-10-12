@@ -10,7 +10,7 @@ guidance here and implementation rationale beside the relevant code.
 - `dynamolock.go`: acquisition, reads, and shared request/retry helpers.
 - `lease.go`: lease state, lifetime, renewal, and payload operations.
 - `codec.go`, `table.go`: envelope encoding, primary keys and schema validation.
-- `discovery.go`: typed one-page Query/Scan using SDK read options.
+- `discovery.go`, `index_discovery.go`: typed one-page document/index discovery using SDK read options.
 - `payload.go`, `projection.go`: field-preserving merging and SDK field-name mapping.
 - `main_test.go`: mandatory AWS setup and account verification for every test run.
 - `dynamolock_test.go`, `payload_test.go`: scripted protocol and fixture tests.
@@ -52,6 +52,9 @@ guidance here and implementation rationale beside the relevant code.
   explicitly incomplete read-only values with exact selected payload paths plus
   keys and both lease fields; base-table only, no full reread or writer capability.
   Missing selected data never proves the complete payload is absent or valid.
+- QueryIndex returns distinct index observations from primary keys and configured
+  outer copies only, ignoring data and lease metadata. Restrict selection to index
+  attributes or counts; never fetch parent documents or infer payload absence.
 - `RequireExisting` checks item existence at acquisition, not payload presence
   or a generation of the key. It does not detect deletion followed by recreation.
 - The holder establishes expiry in Unix nanoseconds. Takeover requires
