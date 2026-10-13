@@ -47,13 +47,16 @@ var ErrOutcomeUnknown = errors.New("write outcome unknown")
 // LockInput configures acquisition and renewal. Lock copies it before use;
 // callers may reuse it after Lock returns, but must not mutate it during Lock.
 type LockInput struct {
-	Table             Table
-	Key               Key
-	RequireExisting   bool          // Check item existence, not payload presence.
-	HeartbeatMaxAge   time.Duration // Duration of each lease, established by its holder.
-	HeartbeatInterval time.Duration // Measured from the last confirmed request's start.
-	Retries           int           // Additional attempts after ordinary contention.
-	RetriesSleep      time.Duration // Zero uses one second.
+	Table           Table
+	Key             Key
+	RequireExisting bool // Check item existence, not payload presence.
+
+	// LeaseDuration is the lifetime established by acquisition and each renewal.
+	// Renewal is due every quarter-duration, measured from the last confirmed
+	// request's start. Must be at least 4ns so that interval is positive.
+	LeaseDuration time.Duration
+	Retries       int           // Additional attempts after ordinary contention.
+	RetriesSleep  time.Duration // Zero uses one second.
 }
 
 // ReadOptions controls non-locking single-item reads. The zero value requests
@@ -113,11 +116,11 @@ func Lock[T any](ctx context.Context, client *dynamodb.Client, input *LockInput)
 	if err := validateType[T](); err != nil {
 		return nil, nil, err
 	}
-	if in.HeartbeatInterval <= 0 || in.HeartbeatMaxAge <= in.HeartbeatInterval {
-		return nil, nil, errors.New("heartbeat max age must exceed a positive heartbeat interval")
+	if in.LeaseDuration < 4*time.Nanosecond {
+		return nil, nil, errors.New("lease duration must be at least 4ns")
 	}
-	if int64(in.HeartbeatMaxAge) > math.MaxInt64-time.Now().UnixNano() {
-		return nil, nil, errors.New("heartbeat max age exceeds the Unix nanosecond range")
+	if int64(in.LeaseDuration) > math.MaxInt64-time.Now().UnixNano() {
+		return nil, nil, errors.New("lease duration exceeds the Unix nanosecond range")
 	}
 	if in.Retries < 0 || in.RetriesSleep < 0 {
 		return nil, nil, errors.New("retries and retries sleep must not be negative")
@@ -148,9 +151,10 @@ func Lock[T any](ctx context.Context, client *dynamodb.Client, input *LockInput)
 	if err != nil {
 		return nil, nil, err
 	}
-	if r.key != in.Key || r.owner != owner || r.expires != started.Add(in.HeartbeatMaxAge).UnixNano() {
+	if r.revision.generation == "" || r.key != in.Key || r.owner != owner || r.expires != started.Add(in.LeaseDuration).UnixNano() {
 		return nil, nil, fmt.Errorf("%w: acquisition returned unexpected ownership", ErrInvalidRecord)
 	}
+	l.revision = r.revision
 	l.raw, err = snapshotPayload(r.data)
 	if err != nil {
 		return nil, nil, err
@@ -192,13 +196,14 @@ func number(n int64) types.AttributeValue {
 
 func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner string) (map[string]types.AttributeValue, time.Time, error) {
 	contention, failures := 0, 0
+	generation := rand.Text()
 	for {
 		started := time.Now()
-		expires := started.Add(in.HeartbeatMaxAge)
+		expires := started.Add(in.LeaseDuration)
 		attemptCtx, cancel := context.WithDeadline(ctx, expires)
 		// Compare the holder's deadline without rounding or including equality.
 		// A contender's lease duration must not affect when takeover is allowed.
-		condition := "((attribute_not_exists(#owner) AND attribute_not_exists(#expires)) OR #expires < :now)"
+		condition := availableCondition
 		if in.RequireExisting {
 			condition = "attribute_exists(#id) AND " + condition
 		}
@@ -206,15 +211,17 @@ func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner s
 		if in.RequireExisting {
 			names["#id"] = in.Table.PartitionKey
 		}
+		values := map[string]types.AttributeValue{
+			":owner": &types.AttributeValueMemberS{Value: owner},
+			":now":   number(started.UnixNano()), ":expires": number(expires.UnixNano()),
+		}
+		condition += " AND " + acquisitionRevision(names, values, generation)
 		output, err := client.UpdateItem(attemptCtx, &dynamodb.UpdateItemInput{
 			TableName: aws.String(in.Table.Name), Key: in.Table.key(in.Key),
-			ConditionExpression:      aws.String(condition),
-			UpdateExpression:         aws.String("SET #owner = :owner, #expires = :expires"),
-			ExpressionAttributeNames: names,
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":owner": &types.AttributeValueMemberS{Value: owner},
-				":now":   number(started.UnixNano()), ":expires": number(expires.UnixNano()),
-			},
+			ConditionExpression:                 aws.String(condition),
+			UpdateExpression:                    aws.String("SET #owner = :owner, #expires = :expires, #generation = if_not_exists(#generation, :generation), #version = if_not_exists(#version, :zero) + :one"),
+			ExpressionAttributeNames:            names,
+			ExpressionAttributeValues:           values,
 			ReturnValues:                        types.ReturnValueAllNew,
 			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
 		}, noSDKRetry)
@@ -224,8 +231,12 @@ func acquire(ctx context.Context, client *dynamodb.Client, in LockInput, owner s
 		}
 		if failure, ok := conditionalFailure(err); ok {
 			cancel()
-			if _, parseErr := parseRecord(in.Table, failure.Item); parseErr != nil {
+			r, parseErr := parseRecord(in.Table, failure.Item)
+			if parseErr != nil {
 				return nil, started, parseErr
+			}
+			if r.revision.version == math.MaxUint64 {
+				return nil, started, ErrVersionExhausted
 			}
 			if in.RequireExisting && len(failure.Item) == 0 {
 				return nil, started, ErrLockNotFound

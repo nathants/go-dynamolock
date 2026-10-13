@@ -128,7 +128,7 @@ func TestLiveFixtureLifecycle(t *testing.T) {
 		setupTable(t, client, "fixture-table", os.Getenv("REUSE") != "")
 		if scenario == "failed_lease" {
 			lease, _, err := Lock[Data](t.Context(), client, &LockInput{
-				Table: Table{Name: "fixture-table"}, Key: Key{Partition: "lock"}, HeartbeatMaxAge: 2 * time.Minute, HeartbeatInterval: time.Minute,
+				Table: Table{Name: "fixture-table"}, Key: Key{Partition: "lock"}, LeaseDuration: 2 * time.Minute,
 			})
 			cleanupLease(t, lease)
 			if err != nil {
@@ -443,6 +443,7 @@ func acquiredItem(w wireRequest, data string) map[string]json.RawMessage {
 	item := map[string]json.RawMessage{
 		"id": w.Key["id"], "owner_token": w.ExpressionAttributeValues[":owner"],
 		"expires_at": w.ExpressionAttributeValues[":expires"],
+		"generation": w.ExpressionAttributeValues[":generation"], "version": json.RawMessage(`{"N":"1"}`),
 	}
 	if data != "" {
 		item["data"] = json.RawMessage(`{"M":` + data + `}`)
@@ -455,7 +456,7 @@ func acquireReply(w wireRequest, data string) (int, any, error) {
 }
 
 func protocolInput() *LockInput {
-	return &LockInput{Table: Table{Name: "protocol-table"}, Key: Key{Partition: "key"}, HeartbeatMaxAge: 2 * time.Hour, HeartbeatInterval: time.Hour}
+	return &LockInput{Table: Table{Name: "protocol-table"}, Key: Key{Partition: "key"}, LeaseDuration: 2 * time.Hour}
 }
 
 func wireInt(w wireRequest, name string) int64 {
@@ -673,7 +674,7 @@ func TestProtocolAtomicAcquireAndCopiedInput(t *testing.T) {
 	if data == nil || data.ID != "key" || data.Value != "fresh" || len(calls) != 1 {
 		t.Fatalf("payload not returned by atomic acquire: %#v, requests=%d", data, len(calls))
 	}
-	in.Table.Name, in.Key.Partition, in.HeartbeatInterval = "wrong-table", "wrong-key", time.Nanosecond
+	in.Table.Name, in.Key.Partition, in.LeaseDuration = "wrong-table", "wrong-key", time.Nanosecond
 	if err := l.Commit(t.Context(), data); err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +695,7 @@ func TestLockExpirationDoesNotIncludeRoundedBoundary(t *testing.T) {
 		return 400, conditionalJSON, nil
 	})
 	in := protocolInput()
-	in.HeartbeatMaxAge, in.HeartbeatInterval = 100*time.Millisecond, 40*time.Millisecond
+	in.LeaseDuration = 100 * time.Millisecond
 	before := time.Now()
 	_, _, err := Lock[keyedData](t.Context(), client, in)
 	after := time.Now()
@@ -705,7 +706,7 @@ func TestLockExpirationDoesNotIncludeRoundedBoundary(t *testing.T) {
 		t.Fatalf("not comparing the holder's expiry: %s", w.ConditionExpression)
 	}
 	cutoff, expiry := wireInt(w, ":now"), wireInt(w, ":expires")
-	if cutoff < before.UnixNano() || cutoff > after.UnixNano() || expiry-cutoff != int64(in.HeartbeatMaxAge) {
+	if cutoff < before.UnixNano() || cutoff > after.UnixNano() || expiry-cutoff != int64(in.LeaseDuration) {
 		t.Fatalf("truncated or contender-adjusted timestamps: cutoff=%d expiry=%d", cutoff, expiry)
 	}
 }
@@ -798,7 +799,7 @@ func TestProtocolSlowPayloadCannotOverwriteHeartbeat(t *testing.T) {
 		return 200, `{}`, nil
 	})
 	in := protocolInput()
-	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 10*time.Millisecond
+	in.LeaseDuration = time.Second
 	l, _, err := Lock[blockingPayload](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
@@ -815,7 +816,7 @@ func TestProtocolSlowPayloadCannotOverwriteHeartbeat(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if renewals.Load() == 0 || payload.UpdateExpression != "SET #data = :data" || payload.ExpressionAttributeValues[":next"] != nil || payload.ExpressionAttributeValues[":expires"] != nil {
+	if renewals.Load() == 0 || payload.UpdateExpression != "SET #data = :data, #generation = :generation, #version = :newVersion" || payload.ExpressionAttributeValues[":next"] != nil || payload.ExpressionAttributeValues[":expires"] != nil {
 		t.Fatalf("payload write could roll back renewal metadata: %#v", payload)
 	}
 }
@@ -848,7 +849,7 @@ func TestProtocolHeartbeatRetriesUseFreshTimestamps(t *testing.T) {
 		return 200, `{}`, nil
 	})
 	in := protocolInput()
-	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 100*time.Millisecond
+	in.LeaseDuration = time.Second
 	l, _, err := Lock[keyedData](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
@@ -878,7 +879,7 @@ func TestProtocolLeaseDeadlineCancelsBlockedRenewal(t *testing.T) {
 		return 200, `{}`, nil
 	})
 	in := protocolInput()
-	in.HeartbeatMaxAge, in.HeartbeatInterval = 80*time.Millisecond, 10*time.Millisecond
+	in.LeaseDuration = 80 * time.Millisecond
 	l, _, err := Lock[keyedData](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
@@ -912,7 +913,7 @@ func TestProtocolDefinitiveLossIsNotRetried(t *testing.T) {
 		return 400, conditionalJSON, nil
 	})
 	in := protocolInput()
-	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, time.Millisecond
+	in.LeaseDuration = time.Second
 	l, _, err := Lock[keyedData](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
@@ -958,7 +959,7 @@ func TestProtocolHeartbeatDuringCommitDoesNotCancelItsResponse(t *testing.T) {
 		return 200, `{}`, nil
 	})
 	in := protocolInput()
-	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 10*time.Millisecond
+	in.LeaseDuration = time.Second
 	l, _, err := Lock[keyedData](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
@@ -1086,7 +1087,7 @@ func TestProtocolPayloadConditionFailureLosesLease(t *testing.T) {
 				t.Fatal(err)
 			}
 			cleanupLease(t, l)
-			write, update := l.Update, "SET #data = :data"
+			write, update := l.Update, "SET #data = :data, #generation = :generation, #version = :newVersion"
 			if commit {
 				write, update = l.Commit, update+" REMOVE #owner, #expires"
 			}
@@ -1096,8 +1097,8 @@ func TestProtocolPayloadConditionFailureLosesLease(t *testing.T) {
 			if _, conditional := conditionalFailure(err); !conditional || !errors.Is(err, ErrLeaseLost) || !errors.Is(context.Cause(l.Context()), ErrLeaseLost) {
 				t.Fatalf("conditional payload failure did not lose the lease: %v", err)
 			}
-			if payload.ConditionExpression != "#owner = :owner AND #expires > :now" || payload.UpdateExpression != update ||
-				!reflect.DeepEqual(payload.ExpressionAttributeNames, map[string]string{"#owner": "owner_token", "#expires": "expires_at", "#data": "data"}) ||
+			if payload.ConditionExpression != "#owner = :owner AND #expires > :now AND "+revisionCondition || payload.UpdateExpression != update ||
+				!reflect.DeepEqual(payload.ExpressionAttributeNames, map[string]string{"#owner": "owner_token", "#expires": "expires_at", "#data": "data", "#generation": "generation", "#version": "version"}) ||
 				string(payload.ExpressionAttributeValues[":owner"]) != string(acquisition.ExpressionAttributeValues[":owner"]) {
 				t.Fatalf("payload fencing mismatch: condition=%q update=%q names=%v owner=%s", payload.ConditionExpression, payload.UpdateExpression, payload.ExpressionAttributeNames, payload.ExpressionAttributeValues[":owner"])
 			}
@@ -1157,8 +1158,11 @@ func TestProtocolValidationDoesNotCallAWS(t *testing.T) {
 		func(in *LockInput) { in.Table.Name = "" },
 		func(in *LockInput) { in.Key.Partition = "" },
 		func(in *LockInput) { in.Key.Partition = strings.Repeat("x", 2049) },
-		func(in *LockInput) { in.HeartbeatInterval = in.HeartbeatMaxAge },
-		func(in *LockInput) { in.HeartbeatInterval = 0 },
+		func(in *LockInput) { in.LeaseDuration = -time.Second },
+		func(in *LockInput) { in.LeaseDuration = 0 },
+		func(in *LockInput) { in.LeaseDuration = time.Nanosecond },
+		func(in *LockInput) { in.LeaseDuration = 3 * time.Nanosecond },
+		func(in *LockInput) { in.LeaseDuration = time.Duration(1<<63 - 1) },
 		func(in *LockInput) { in.Retries = -1 },
 		func(in *LockInput) { in.RetriesSleep = -1 },
 	} {
@@ -1261,7 +1265,7 @@ func TestProtocolReleaseFailureKeepsHeartbeat(t *testing.T) {
 		return 200, `{}`, nil
 	})
 	in := protocolInput()
-	in.HeartbeatMaxAge, in.HeartbeatInterval = time.Second, 10*time.Millisecond
+	in.LeaseDuration = time.Second
 	l, _, err := Lock[keyedData](t.Context(), client, in)
 	if err != nil {
 		t.Fatal(err)
@@ -1445,7 +1449,7 @@ func TestProtocolRenewalRetriesUntilConfirmedDeadline(t *testing.T) {
 					return 200, `{}`, nil
 				})
 				in := protocolInput()
-				in.HeartbeatMaxAge, in.HeartbeatInterval = time.Minute, 5*time.Second
+				in.LeaseDuration = time.Minute
 				start := time.Now()
 				l, _, err := Lock[keyedData](t.Context(), client, in)
 				if err != nil {
@@ -1455,7 +1459,7 @@ func TestProtocolRenewalRetriesUntilConfirmedDeadline(t *testing.T) {
 				if tc.cause == "" {
 					// Only a renewal confirmed after the failures can outlive the
 					// acquisition's deadline.
-					time.Sleep(2 * in.HeartbeatMaxAge)
+					time.Sleep(2 * in.LeaseDuration)
 					if err := context.Cause(l.Context()); err != nil {
 						t.Fatalf("transient failures lost the lease: %v", err)
 					}
@@ -1465,7 +1469,7 @@ func TestProtocolRenewalRetriesUntilConfirmedDeadline(t *testing.T) {
 					if !errors.Is(cause, ErrLeaseLost) || !strings.Contains(cause.Error(), tc.cause) {
 						t.Fatalf("loss lacks underlying cause %q: %v", tc.cause, cause)
 					}
-					if elapsed := time.Since(start); !tc.fatal && elapsed != in.HeartbeatMaxAge {
+					if elapsed := time.Since(start); !tc.fatal && elapsed != in.LeaseDuration {
 						t.Fatalf("retries ended after %v, not at the confirmed deadline", elapsed)
 					}
 				}
@@ -1483,7 +1487,7 @@ func TestProtocolRenewalRetriesUntilConfirmedDeadline(t *testing.T) {
 					t.Fatalf("no renewal succeeded: %d attempts", attempts)
 				}
 				for _, timeout := range timeouts {
-					if timeout > in.HeartbeatMaxAge/2 {
+					if timeout > in.LeaseDuration/2 {
 						t.Fatalf("renewal attempt timeout exceeded half the lease: %v", timeouts)
 					}
 				}
@@ -1493,7 +1497,7 @@ func TestProtocolRenewalRetriesUntilConfirmedDeadline(t *testing.T) {
 }
 
 // A slow but steady network must keep a lease whose budget covers each
-// response: 600ms renewals fit a 2s lease renewed every 200ms.
+// response: 600ms renewals fit a 2s lease even when slower than its 500ms interval.
 func TestProtocolSlowRenewalResponsesKeepLease(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var renewals atomic.Int32
@@ -1513,13 +1517,13 @@ func TestProtocolSlowRenewalResponsesKeepLease(t *testing.T) {
 			return 200, `{}`, nil
 		})
 		in := protocolInput()
-		in.HeartbeatMaxAge, in.HeartbeatInterval = 2*time.Second, 200*time.Millisecond
+		in.LeaseDuration = 2 * time.Second
 		l, _, err := Lock[keyedData](t.Context(), client, in)
 		if err != nil {
 			t.Fatal(err)
 		}
 		cleanupLease(t, l)
-		time.Sleep(10 * in.HeartbeatMaxAge)
+		time.Sleep(10 * in.LeaseDuration)
 		if err := context.Cause(l.Context()); err != nil || renewals.Load() < 10 {
 			t.Fatalf("slow renewals lost the lease after %d confirmations: %v", renewals.Load(), err)
 		}
@@ -1552,7 +1556,7 @@ func TestProtocolRenewalRetryStopsOnCancellationAndCompletion(t *testing.T) {
 					return 200, `{}`, nil
 				})
 				in := protocolInput()
-				in.HeartbeatMaxAge, in.HeartbeatInterval = time.Minute, 5*time.Second
+				in.LeaseDuration = time.Minute
 				parent, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				l, _, err := Lock[keyedData](parent, client, in)
@@ -1581,7 +1585,7 @@ func TestProtocolRenewalRetryStopsOnCancellationAndCompletion(t *testing.T) {
 				if stop == "parent" {
 					want = context.Canceled
 				}
-				time.Sleep(2 * in.HeartbeatMaxAge)
+				time.Sleep(2 * in.LeaseDuration)
 				if cause := context.Cause(l.Context()); !errors.Is(cause, want) || renewals.Load() != 3 {
 					t.Fatalf("renewal continued after stop: %d %v", renewals.Load(), cause)
 				}

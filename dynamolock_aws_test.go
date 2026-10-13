@@ -221,10 +221,9 @@ func TestBasic(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -234,10 +233,9 @@ func TestBasic(t *testing.T) {
 		t.Fatalf("data should be nil")
 	}
 	contender, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, contender)
 	if err == nil {
@@ -275,12 +273,11 @@ func TestReadModifyWrite(t *testing.T) {
 				default:
 				}
 				lease, data, err := Lock[counter](ctx, client, &LockInput{
-					Table:             Table{Name: table},
-					Key:               Key{Partition: id},
-					HeartbeatMaxAge:   liveLease,
-					HeartbeatInterval: time.Second * 1,
-					Retries:           5,
-					RetriesSleep:      1 * time.Second,
+					Table:         Table{Name: table},
+					Key:           Key{Partition: id},
+					LeaseDuration: liveLease,
+					Retries:       5,
+					RetriesSleep:  1 * time.Second,
 				})
 				cleanupLease(t, lease)
 				if errors.Is(err, ErrLockHeld) {
@@ -328,10 +325,9 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 
 	id := Uid()
 	unlock, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   2 * time.Minute,
-		HeartbeatInterval: time.Minute,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: 2 * time.Minute,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -369,10 +365,9 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 		defer close(finished)
 		delayedCtx := context.WithValue(contenderCtx, delayAcquireContextKey{}, true)
 		unlock, data, err := Lock[Data](delayedCtx, delayedClient, &LockInput{
-			Table:             Table{Name: table},
-			Key:               Key{Partition: id},
-			HeartbeatMaxAge:   30 * time.Second,
-			HeartbeatInterval: 15 * time.Second,
+			Table:         Table{Name: table},
+			Key:           Key{Partition: id},
+			LeaseDuration: 30 * time.Second,
 		})
 		cleanupLease(t, unlock)
 		lockResult <- struct {
@@ -389,10 +384,9 @@ func TestLockReturnsDataFromSuccessfulAcquire(t *testing.T) {
 	}
 
 	otherUnlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   2 * time.Minute,
-		HeartbeatInterval: time.Minute,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: 2 * time.Minute,
 	})
 	cleanupLease(t, otherUnlock)
 	if err != nil {
@@ -458,10 +452,9 @@ func TestData(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[testData](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -475,10 +468,9 @@ func TestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	unlock, data, err = Lock[testData](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -503,10 +495,9 @@ func TestData(t *testing.T) {
 		t.Fatal(err)
 	}
 	unlock, data, err = Lock[testData](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -529,13 +520,12 @@ func TestLockRequireExisting(t *testing.T) {
 
 	id := "require-existing"
 	missing, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		RequireExisting:   true,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
-		Retries:           2,
-		RetriesSleep:      time.Nanosecond,
+		Table:           Table{Name: table},
+		Key:             Key{Partition: id},
+		RequireExisting: true,
+		LeaseDuration:   30 * time.Second,
+		Retries:         2,
+		RetriesSleep:    time.Nanosecond,
 	})
 	cleanupLease(t, missing)
 	if !errors.Is(err, ErrLockNotFound) {
@@ -556,10 +546,9 @@ func TestLockRequireExisting(t *testing.T) {
 	}
 
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: 30 * time.Second,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -573,11 +562,10 @@ func TestLockRequireExisting(t *testing.T) {
 	}
 
 	unlock, data, err = Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		RequireExisting:   true,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
+		Table:           Table{Name: table},
+		Key:             Key{Partition: id},
+		RequireExisting: true,
+		LeaseDuration:   30 * time.Second,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -588,11 +576,10 @@ func TestLockRequireExisting(t *testing.T) {
 	}
 
 	contender, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		RequireExisting:   true,
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
+		Table:           Table{Name: table},
+		Key:             Key{Partition: id},
+		RequireExisting: true,
+		LeaseDuration:   30 * time.Second,
 	})
 	cleanupLease(t, contender)
 	if !errors.Is(err, ErrLockHeld) {
@@ -633,10 +620,9 @@ func TestPreExistingData(t *testing.T) {
 	}
 	id := "test-id"
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -648,10 +634,9 @@ func TestPreExistingData(t *testing.T) {
 		t.Fatal("wrong value")
 	}
 	contender, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, contender)
 	if !errors.Is(err, ErrLockHeld) {
@@ -672,10 +657,9 @@ func TestWriteWithoutUnlocking(t *testing.T) {
 	client, table := liveTable(t)
 	id := "test-id"
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   time.Second * 30,
-		HeartbeatInterval: time.Second * 1,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: time.Second * 30,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -747,10 +731,9 @@ func TestUnlockTwiceFails(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   liveLease,
-		HeartbeatInterval: 1 * time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: liveLease,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -775,10 +758,9 @@ func TestContextCancelBeforeLock(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   2 * time.Second,
-		HeartbeatInterval: 1 * time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: 2 * time.Second,
 	})
 	cleanupLease(t, unlock)
 	if err == nil {
@@ -794,10 +776,9 @@ func TestContextCancelExpired(t *testing.T) {
 	firstCtx, cancelFirst := context.WithCancel(ctx)
 	defer cancelFirst()
 	first, _, err := Lock[Data](firstCtx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   liveLease,
-		HeartbeatInterval: 1 * time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: liveLease,
 	})
 	cleanupLease(t, first)
 	if err != nil {
@@ -810,10 +791,9 @@ func TestContextCancelExpired(t *testing.T) {
 	await(t, first.done)
 	time.Sleep(liveLease + 2*time.Second)
 	second, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   liveLease,
-		HeartbeatInterval: 1 * time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: liveLease,
 	})
 	cleanupLease(t, second)
 	if err != nil {
@@ -852,10 +832,9 @@ func TestCommitEmptyData(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   liveLease,
-		HeartbeatInterval: 1 * time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: liveLease,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -885,10 +864,9 @@ func TestUpdateEmptyData(t *testing.T) {
 	client, table := liveTable(t)
 	id := Uid()
 	unlock, data, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   liveLease,
-		HeartbeatInterval: 1 * time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: liveLease,
 	})
 	cleanupLease(t, unlock)
 	if err != nil {
@@ -925,10 +903,9 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	first, _, err := Lock[Data](cancelCtx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   liveLease,
-		HeartbeatInterval: 1 * time.Second,
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: liveLease,
 	})
 	cleanupLease(t, first)
 	if err != nil {
@@ -938,12 +915,11 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 	cancel()
 
 	unlock2, _, err := Lock[Data](ctx, client, &LockInput{
-		Table:             Table{Name: table},
-		Key:               Key{Partition: id},
-		HeartbeatMaxAge:   liveLease,
-		HeartbeatInterval: 1 * time.Second,
-		Retries:           100,
-		RetriesSleep:      500 * time.Millisecond, // Sleeps alone outlast the first lease.
+		Table:         Table{Name: table},
+		Key:           Key{Partition: id},
+		LeaseDuration: liveLease,
+		Retries:       100,
+		RetriesSleep:  500 * time.Millisecond, // Sleeps alone outlast the first lease.
 	})
 	cleanupLease(t, unlock2)
 	if err != nil {
@@ -960,7 +936,7 @@ func TestLockSucceedsAfterRetryWhenExpires(t *testing.T) {
 const liveLease = 30 * time.Second
 
 func liveInput(table string) *LockInput {
-	return &LockInput{Table: Table{Name: table}, Key: Key{Partition: Uid()}, HeartbeatMaxAge: liveLease, HeartbeatInterval: time.Second}
+	return &LockInput{Table: Table{Name: table}, Key: Key{Partition: Uid()}, LeaseDuration: liveLease}
 }
 
 // Inspect a request for fault injection without consuming the body sent to AWS.
@@ -1035,6 +1011,8 @@ func TestLeaseAWS(t *testing.T) {
 		if err := l.Release(t.Context()); err != nil {
 			t.Fatal(err)
 		}
+		item["generation"] = &types.AttributeValueMemberS{Value: l.revision.generation}
+		item["version"] = versionNumber(1)
 		actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
 		if err != nil || !reflect.DeepEqual(actual, item) {
 			t.Fatalf("release changed raw payload: %#v %v", actual, err)
@@ -1055,7 +1033,7 @@ func TestLeaseAWS(t *testing.T) {
 		contender := *in
 		// Use a distinctly shorter lease than the current holder's, while
 		// leaving the acquisition request ample time for network latency.
-		contender.HeartbeatMaxAge, contender.HeartbeatInterval = 16*time.Second, time.Second
+		contender.LeaseDuration = 16 * time.Second
 		if other, _, err := Lock[keyedData](t.Context(), client, &contender); !errors.Is(err, ErrLockHeld) {
 			if other != nil {
 				cleanupLease(t, other)
@@ -1074,6 +1052,7 @@ func TestLeaseAWS(t *testing.T) {
 			t.Fatal(err)
 		}
 		want["data"].(*types.AttributeValueMemberM).Value["unknown"] = item["data"].(*types.AttributeValueMemberM).Value["unknown"]
+		want["generation"], want["version"] = item["generation"], versionNumber(4)
 		if !reflect.DeepEqual(actual, want) {
 			t.Fatalf("commit changed unknown payload fields: %#v", actual)
 		}
@@ -1091,8 +1070,8 @@ func TestLeaseAWS(t *testing.T) {
 		await(t, first.done)
 		// Allow real AWS request latency, while requiring takeover well before
 		// the contender's longer lease duration could have elapsed.
-		holderLease := in.HeartbeatMaxAge
-		in.HeartbeatMaxAge, in.HeartbeatInterval = 3*holderLease, time.Second
+		holderLease := in.LeaseDuration
+		in.LeaseDuration = 3 * holderLease
 		in.Retries, in.RetriesSleep = 100, 500*time.Millisecond
 		takeoverCtx, cancelTakeover := context.WithTimeout(t.Context(), holderLease+30*time.Second)
 		defer cancelTakeover()
@@ -1119,7 +1098,7 @@ func TestLeaseAWS(t *testing.T) {
 		t.Run("delayed stale "+operation, func(t *testing.T) {
 			in := liveInput(table)
 			// The successor must outlast the first lease, then finish its own writes.
-			ctx, cancel := context.WithTimeout(t.Context(), in.HeartbeatMaxAge+time.Minute)
+			ctx, cancel := context.WithTimeout(t.Context(), in.LeaseDuration+time.Minute)
 			firstCtx, cancelFirst := context.WithCancel(ctx)
 			entered, resumeRequest := make(chan struct{}), make(chan struct{})
 			resume := sync.OnceFunc(func() { close(resumeRequest) })
@@ -1246,7 +1225,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(in.HeartbeatMaxAge + 300*time.Millisecond)
+		time.Sleep(in.LeaseDuration + 300*time.Millisecond)
 		if l.Context().Err() != nil || injected.Load() != 1 {
 			t.Fatalf("renewal stopped: injected=%d cause=%v", injected.Load(), context.Cause(l.Context()))
 		}
@@ -1311,7 +1290,7 @@ func TestLeaseAWS(t *testing.T) {
 		}
 		cleanupLease(t, l)
 		// The first attempt is held for its whole timeout before the retry.
-		awaitWithin(t, renewed, in.HeartbeatMaxAge)
+		awaitWithin(t, renewed, in.LeaseDuration)
 		late := <-held
 		replayCtx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 		defer cancel()
@@ -1356,7 +1335,7 @@ func TestLeaseAWS(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		awaitWithin(t, l.Context().Done(), in.HeartbeatMaxAge)
+		awaitWithin(t, l.Context().Done(), in.LeaseDuration)
 		if !errors.Is(context.Cause(l.Context()), ErrLeaseLost) || !errors.Is(l.Update(t.Context(), &keyedData{}), ErrLeaseLost) {
 			t.Fatalf("ownership loss was not terminal: %v", context.Cause(l.Context()))
 		}
@@ -1431,6 +1410,11 @@ func TestLeaseAWS(t *testing.T) {
 			t.Fatalf("malformed payload unexpectedly acquired: %v", err)
 		}
 		actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, in.Key)
+		rev, revisionErr := readRevision(actual)
+		if revisionErr != nil || rev.generation == "" || rev.version != 1 {
+			t.Fatalf("decode cleanup lost initialized revision: %+v %v", rev, revisionErr)
+		}
+		item["generation"], item["version"] = actual["generation"], versionNumber(1)
 		if err != nil || !reflect.DeepEqual(actual, maps.Clone(item)) {
 			t.Fatalf("decode cleanup failed to preserve record: %#v %v", actual, err)
 		}

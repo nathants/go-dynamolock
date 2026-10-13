@@ -28,9 +28,9 @@ func snapshotPayload(payload *types.AttributeValueMemberM) (*types.AttributeValu
 }
 
 // mergePayload retains raw fields that this reader does not understand. The
-// exclusive lease makes one bounded SET of the merged data safe; generating one
+// lease or revision fence makes one bounded SET of the merged data safe; generating one
 // expression per nested field would impose DynamoDB's 4 KiB expression limit on
-// otherwise valid payloads. No other writer may bypass this lease protocol.
+// otherwise valid payloads. All writers must participate in the shared protocol.
 func mergePayload[T any](raw, before, after *types.AttributeValueMemberM) (*types.AttributeValueMemberM, error) {
 	if raw == nil {
 		return after, nil

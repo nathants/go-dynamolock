@@ -135,10 +135,11 @@ func marshalPayload(table Table, key Key, data any) (*types.AttributeValueMember
 }
 
 type record struct {
-	key     Key
-	owner   string
-	expires int64
-	data    *types.AttributeValueMemberM
+	revision revision
+	key      Key
+	owner    string
+	expires  int64
+	data     *types.AttributeValueMemberM
 }
 
 func parseRecord(table Table, item map[string]types.AttributeValue) (record, error) {
@@ -155,10 +156,14 @@ func parseRecord(table Table, item map[string]types.AttributeValue) (record, err
 	// legacy row must never be interpreted as an empty application document.
 	if _, hasData := item["data"]; !hasData {
 		for name := range item {
-			if name != table.PartitionKey && (table.SortKey == "" || name != table.SortKey) && name != "owner_token" && name != "expires_at" {
+			if name != table.PartitionKey && (table.SortKey == "" || name != table.SortKey) && name != "owner_token" && name != "expires_at" && name != "generation" && name != "version" {
 				return r, fmt.Errorf("%w: unexpected outer attribute %q without data", ErrInvalidRecord, name)
 			}
 		}
+	}
+	r.revision, err = readRevision(item)
+	if err != nil {
+		return r, err
 	}
 	var ok bool
 	if value, exists := item["data"]; exists {

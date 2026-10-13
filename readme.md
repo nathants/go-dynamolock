@@ -6,7 +6,7 @@ Locking around DynamoDB should be simple and easy.
 
 ## What
 
-A small Go library for locking and atomically updating data in DynamoDB.
+A small Go library for leases and optimistic conditional updates in DynamoDB.
 
 ## How
 
@@ -18,6 +18,8 @@ background heartbeat extends the lease while it is held.
 `Release` releases the lock without changing data. `Delete` removes the item under
 the live lease. `Read` reads without locking, including data published by `Update`.
 Read consistency is configurable; see [Read consistency and cost](#read-consistency-and-cost).
+`ReadCAS` provides an alternative optimistic writer without leases or heartbeats;
+see [Optimistic writes (CAS)](#optimistic-writes-cas).
 
 Set `Retries` to the number of additional acquisition attempts on contention.
 `RetriesSleep` controls the delay between them and defaults to one second.
@@ -55,12 +57,11 @@ type Data struct {
 
 func update(ctx context.Context, client *dynamodb.Client) (err error) {
 	lease, data, err := dynamolock.Lock[Data](ctx, client, &dynamolock.LockInput{
-		Table:             dynamolock.Table{Name: "table"},
-		Key:               dynamolock.Key{Partition: "lock1"},
-		HeartbeatMaxAge:   30 * time.Second,
-		HeartbeatInterval: time.Second,
-		Retries:           5,
-		RetriesSleep:      time.Second,
+		Table:         dynamolock.Table{Name: "table"},
+		Key:           dynamolock.Key{Partition: "lock1"},
+		LeaseDuration: 30 * time.Second,
+		Retries:       5,
+		RetriesSleep:  time.Second,
 	})
 	if err != nil {
 		return err
@@ -81,6 +82,102 @@ func update(ctx context.Context, client *dynamodb.Client) (err error) {
 
 The deferred `Release` handles early returns and cancellation. It is harmless
 after a successful `Commit` or `Delete`.
+
+## Optimistic writes (CAS)
+
+Use `ReadCAS` for short, repeatable work that does not need exclusive ownership.
+It returns a writer handle and the current value, like `Lock`, but creates no
+lease or heartbeat. Reads are **eventually consistent by default**; use
+`ReadOptions{ConsistentRead: true}` to reduce conflicts caused by stale reads.
+The conditional write checks current ownership and revision regardless of the
+read mode. Strong reads cannot prevent changes after the read.
+
+```go
+func optimistic(ctx context.Context, client *dynamodb.Client) error {
+    writer, data, err := dynamolock.ReadCAS[Data](ctx, client,
+        dynamolock.Table{Name: "table"}, dynamolock.Key{Partition: "lock1"},
+        dynamolock.ReadOptions{})
+    if err != nil {
+        // ErrLockHeld may include inspectable data, but writer is always nil
+        // on error. This observation can be stale with eventual reads.
+        return err
+    }
+    if data == nil {
+        data = &Data{}
+    }
+    data.Value = "updated"
+    return writer.Update(ctx, data)
+}
+```
+
+`Update` preserves unknown fields using the same merge and projection rules as
+lease writes. Success advances the handle's private snapshot, so another Update
+needs no intervening read. `Delete` conditionally **hard-deletes** the observed
+record and consumes the handle. For an absent snapshot, Update requires physical
+absence and creates a record; Delete succeeds only while the item remains absent.
+Existing records without payload are distinct internally from absent records.
+There is no Commit, Release, background goroutine, or lease-lifetime context.
+Operations on a handle serialize; do not copy handles or mutate values during calls.
+Ordinary, discovery, and projected reads cannot authorize CAS writes.
+
+An observed live lease returns `ErrLockHeld`, the decoded value if any, and a nil
+writer. A CAS mutation requires no live lease, and atomically removes expired
+ownership when taking over. `ErrConflict` means the generation, version, or
+ownership no longer permits the mutation. It invalidates the handle: reread and
+recompute before retrying. The library never reruns application work. An ambiguous
+mutation returns `ErrOutcomeUnknown` and also invalidates the handle; reconcile
+rather than blindly replaying it. Successful Delete makes later operations return
+`ErrReleased`. Local payload-validation errors do not invalidate the handle.
+
+CAS is useful when conflicts are uncommon and recomputation is cheap. Work before
+publication must tolerate losing the race; irreversible external effects need
+independent idempotency or fencing. Choosing CAS versus a lease is the caller's
+responsibility. Neither mechanism makes multiple records or external effects atomic.
+
+### Shared revisions and existing tables
+
+**All writers must use the versioned go-dynamolock lease or CAS paths.** Stop and
+drain old writers before the cutover; old library implementations cannot safely
+coexist with CAS. Older application structs using the new library still preserve
+unknown fields. Existing tables do not require a bulk migration:
+
+- First lease acquisition initializes revision metadata within its normal write.
+- First CAS access to an existing unversioned record conditionally initializes
+  metadata with one extra write, preserving payload and projections. The returned
+  snapshot comes from that write, never from the potentially stale preceding read.
+  A competing initializer's conditional-failure image can supply the snapshot.
+- Ordinary read-only APIs do not initialize metadata. An absent CAS read also
+  writes nothing; creation and metadata are applied together on its first Update.
+
+Outer `generation` and `version` are reserved alongside lease metadata. Generation
+is an opaque `crypto/rand.Text()` string, assigned on creation/initialization and
+retained until physical deletion. Version starts at 1 and increases on acquisition,
+lease Update/Commit, and CAS Update; heartbeats and release-only do not increment
+it. CAS compares both generation and version, so deletion/recreation cannot make
+an old version authorize writes to a new incarnation. Counters are uint64 and never
+wrap; `ErrVersionExhausted` refuses increments, while a current CAS handle can
+still delete. Do not interpret versions as globally ordered or ordered across
+incarnations. Generation uniqueness is probabilistic, with at least 128 random bits.
+
+Both metadata fields absent means an existing uninitialized record. Partial or
+malformed metadata is an error, not a signal to overwrite it. Existing outer
+attributes or configured keys/projections named `generation` or `version` must be
+resolved before cutover. `MarshalItem` remains a pure unversioned envelope codec,
+not a way to bypass conditional writers. Hard deletion leaves no tombstones.
+
+Lease acquisition stays a single conditional write. DynamoDB can check a number's
+range but not whether it is an integer, so a malformed fractional version can be
+incremented before decoding rejects the record and cleanup releases ownership.
+No usable lease is returned and the payload is unchanged. Participating writers
+never produce fractional versions; there is no pre-read or rollback to repair
+externally malformed metadata. CAS reads reject such metadata without changing it.
+
+In the uncontended, already-versioned case, a CAS update costs one read plus one
+write. For items up to 1 KB, that is 0.5 read units with eventual consistency (1
+with strong) plus 1 write unit. Lock followed by Commit costs two writes, plus
+any heartbeats. Each write, including heartbeat and initialization, is billed
+against the whole item's size; indexes can add cost. Conflicts and retries add
+requests. Intermediate CAS values are published immediately, as with lease Update.
 
 ## Data
 
@@ -121,11 +218,11 @@ Lists and scalar values are atomic fields, not collections with inferred identit
 A changed list that would discard fields hidden by typed decoding is rejected with
 `ErrInvalidPayload`; use a representation retaining the complete element data before
 changing it. No positional merge guesses which record survived an insertion or
-reorder. Custom marshalers run when acquiring existing data as well as on writes;
+reorder. Custom marshalers run when constructing lease/CAS snapshots as well as on writes;
 they must represent the decoded value deterministically and retain attribute names,
 including case. Custom codecs own their name mapping; the library does not infer
 struct aliases inside them. Unknown-field preservation is not permission to bypass
-the lease protocol with another writer.
+the shared lease/CAS protocol with another writer.
 
 Deploy field-preserving writers everywhere before adding fields older binaries
 would erase. Changing an existing field's meaning/type, or deleting a field still
@@ -135,8 +232,8 @@ updates do not make unrelated whole-record or opaque JSON writers compatible.
 `MarshalItem(table, key, value)` encodes an unlocked envelope without a write.
 `UnmarshalItem[T](table, item)` decodes complete envelopes, for example from streams.
 Codecs need only the key schema; `Table{}` uses `id`. Requests require a table name.
-Use `Lock` and `Commit` to create/update application documents. All writers to a
-participating item must follow the same lease protocol.
+Use the lease or CAS path to create/update application documents. All writers to a
+participating item must follow the shared revision and ownership protocol.
 
 ## Read consistency and cost
 
@@ -148,13 +245,13 @@ matters. Neither mode acquires ownership or prevents a later concurrent change.
 
 | API | Default | Opt into strong reads |
 | --- | --- | --- |
-| `Read`, `ReadProjected` | Eventual with `ReadOptions{}` | `ReadOptions{ConsistentRead: true}` |
+| `Read`, `ReadProjected`, `ReadCAS` | Eventual with `ReadOptions{}` | `ReadOptions{ConsistentRead: true}` |
 | `Query`, `QueryIndex`, `Scan`, `ScanProjected` | Eventual when SDK `ConsistentRead` is nil or false | `ConsistentRead: aws.Bool(true)` |
 | `Lock` | Atomic conditional acquisition and payload read | Always; no weak mode |
 
 `Lock` uses a conditional write, not a separately configurable read. Its internal
-reconciliation read always remains strong. Before modifying a document, acquire
-it and work from the value returned by `Lock`, not a previous discovery result.
+reconciliation read always remains strong. Before modifying a document, work
+from the value returned by `Lock` or `ReadCAS`, not a previous discovery result.
 Even strong scans and queries are not collection-wide or multi-page snapshots.
 Global secondary indexes (GSIs) support only eventual reads; base tables and local
 secondary indexes support either mode. `ScanProjected` is base-table only.
@@ -252,8 +349,9 @@ Each item has a `Key` and `Value`. An explicitly selected index without projecte
 with `ReadOptions{ConsistentRead: true}` on that key for current data. Base-table
 discovery retains strict envelope checks.
 An index projecting `data` must project the whole map and either both lease fields
-or neither. Discovery is read-only, may be eventually consistent, and is not a
-collection snapshot. Acquire the actual document before modifying it.
+or neither, and either both revision fields or neither. Discovery is read-only,
+may be eventually consistent, and is not a collection snapshot. Obtain a lease
+or CAS snapshot of the actual document before modifying it.
 
 ### Typed index entries
 
@@ -413,20 +511,30 @@ for {
 
 ## Lease lifetime
 
-`HeartbeatMaxAge` is the lease duration. Choose a shorter `HeartbeatInterval`
-with ample room for network latency and retries. If a holder stops renewing,
-another caller can acquire the item after its expiry passes.
+`LeaseDuration` sets the lifetime established by acquisition and each renewal.
+Heartbeats are automatic: renewal is due every `LeaseDuration / 4`, measured
+from the last confirmed request's **start**, not its response. For example, a
+30-second lease renews every 7.5 seconds. There is no separate interval setting.
+The duration must be at least 4 nanoseconds so the interval is positive; real
+workloads need ample time for network latency and retries.
+
+Choose the duration by the acceptable delay before takeover after a holder
+crashes, balanced against tolerance for network stalls. It is not a limit on
+job duration: a healthy renewing holder can keep a lease longer. If a holder
+stops renewing, another caller can acquire the item after its expiry passes.
+Longer durations reduce heartbeat traffic but delay crash recovery. A lease
+completed before its first heartbeat incurs no heartbeat writes. Update does
+not renew or defer heartbeats; Commit writes and releases in one operation.
 
 Renewal retries throttling, server errors, timeouts, and network failures,
 including DNS lookup failures, until the last confirmed expiry. Each attempt
-times out after half of `HeartbeatMaxAge`, so after a stuck request at most half
-the lease minus `HeartbeatInterval` remains for retries; backoff and delayed
-renewal starts shorten it. Keep the interval well below half the lease. A
-response slower than half the lease is abandoned even if it would have arrived
-in time. If no renewal is confirmed in time, the lease is lost; `context.Cause`
-includes the last renewal failure if an attempt failed before expiry.
-Authorization, validation, and TLS certificate errors lose the lease
-immediately.
+times out after half of `LeaseDuration`, leaving roughly a quarter of the lease
+for retries after a stuck first renewal. Backoff and delayed renewal starts
+shorten that budget. A response slower than half the lease is abandoned even
+if it would have arrived in time. If no renewal is confirmed in time, the lease
+is lost; `context.Cause` includes the last renewal failure if an attempt failed
+before expiry. Authorization, validation, and TLS certificate errors lose the
+lease immediately.
 
 The context passed to `Lock` controls the entire lease lifetime. Use
 `lease.Context()` for protected work and stop when it is canceled; `context.Cause`

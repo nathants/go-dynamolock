@@ -53,7 +53,7 @@ func TestQueryIndexAWS(t *testing.T) {
 	for _, order := range []string{"001", "002", "003"} {
 		lease, _, err := Lock[job](t.Context(), client, &LockInput{
 			Table: table, Key: Key{Partition: "account", Sort: order},
-			HeartbeatMaxAge: 30 * time.Second, HeartbeatInterval: time.Second,
+			LeaseDuration: 30 * time.Second,
 		})
 		cleanupLease(t, lease)
 		if err != nil {

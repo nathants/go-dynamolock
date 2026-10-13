@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -28,8 +29,9 @@ type Lease[T any] struct {
 
 	// Protected by op. The raw snapshot keeps fields this T cannot decode;
 	// visible is the last confirmed caller-visible encoding, not a caller alias.
-	raw     *types.AttributeValueMemberM
-	visible *types.AttributeValueMemberM
+	revision revision
+	raw      *types.AttributeValueMemberM
+	visible  *types.AttributeValueMemberM
 
 	mu        sync.Mutex
 	deadline  time.Time // Includes Go's monotonic clock reading.
@@ -51,7 +53,7 @@ func newLease[T any](ctx context.Context, client *dynamodb.Client, in LockInput,
 	l := &Lease[T]{
 		client: client, input: in, owner: owner, ctx: leaseCtx, cancel: cancel,
 		done: make(chan struct{}), op: make(chan struct{}, 1),
-		deadline: started.Add(in.HeartbeatMaxAge), expires: started.Add(in.HeartbeatMaxAge).UnixNano(),
+		deadline: started.Add(in.LeaseDuration), expires: started.Add(in.LeaseDuration).UnixNano(),
 	}
 	l.mu.Lock()
 	l.armDeadlineLocked()
@@ -128,7 +130,7 @@ func (l *Lease[T]) confirm(started time.Time, expires int64) error {
 	if err := l.liveErrorLocked(); err != nil {
 		return err
 	}
-	l.deadline, l.expires, l.renewalErr = started.Add(l.input.HeartbeatMaxAge), expires, nil
+	l.deadline, l.expires, l.renewalErr = started.Add(l.input.LeaseDuration), expires, nil
 	l.armDeadlineLocked()
 	return nil
 }
@@ -145,7 +147,7 @@ func (l *Lease[T]) heartbeat() {
 			return
 		}
 		l.mu.Lock()
-		next := l.deadline.Add(-l.input.HeartbeatMaxAge + l.input.HeartbeatInterval)
+		next := l.deadline.Add(-l.input.LeaseDuration + l.input.LeaseDuration/4)
 		l.mu.Unlock()
 		if wait(l.ctx, time.Until(next)) != nil {
 			return
@@ -160,23 +162,23 @@ func (l *Lease[T]) heartbeat() {
 // Every retry gets a fresh proposed expiry but shares the last confirmed
 // deadline. An unconfirmed request cannot extend the local lease budget, so
 // transient failures are retried until that deadline rather than a fixed count.
-// Each attempt times out after half the lease, so after a stuck request at most
-// half the lease minus the heartbeat interval remains for retries; backoff and
-// delayed renewal starts shorten it. Any finite cap abandons some slow responses
-// that might have arrived before the deadline.
+// Renewal starts after a quarter of the lease and each attempt times out after
+// half the lease, leaving roughly a quarter for retries after a stuck request.
+// Backoff and delayed renewal starts shorten that budget. Any finite cap abandons
+// some slow responses that might have arrived before the deadline.
 func (l *Lease[T]) renew() error {
 	l.mu.Lock()
 	deadline, confirmedExpiry := l.deadline, l.expires
 	l.mu.Unlock()
 	ctx, cancel := context.WithDeadline(l.ctx, deadline)
 	defer cancel()
-	attemptTimeout := l.input.HeartbeatMaxAge / 2
+	attemptTimeout := l.input.LeaseDuration / 2
 	for attempt := 0; ; attempt++ {
 		if err := l.liveError(); err != nil {
 			return err
 		}
 		started := time.Now()
-		expires := started.Add(l.input.HeartbeatMaxAge).UnixNano()
+		expires := started.Add(l.input.LeaseDuration).UnixNano()
 		if expires <= confirmedExpiry {
 			return errors.New("wall clock moved backward during renewal")
 		}
@@ -309,6 +311,9 @@ func (l *Lease[T]) write(ctx context.Context, data *T, commit bool) error {
 	if err := l.liveError(); err != nil {
 		return err
 	}
+	if l.revision.version == math.MaxUint64 {
+		return ErrVersionExhausted
+	}
 	// Custom marshaling can outlast the lease and cannot be interrupted here.
 	// Recheck liveness afterward before submitting a write.
 	payload, err := marshalPayload(l.input.Table, l.input.Key, data)
@@ -340,16 +345,19 @@ func (l *Lease[T]) write(ctx context.Context, data *T, commit bool) error {
 		if err := callCtx.Err(); err != nil {
 			return err
 		}
-		update, names, values := l.payloadExpression(next, commit)
+		update, names, values := payloadExpression(l.input.Table, next, commit, l.revision.version+1)
+		l.revision.fence(names, values)
+		values[":owner"], values[":now"] = &types.AttributeValueMemberS{Value: l.owner}, number(time.Now().UnixNano())
 		_, err := l.client.UpdateItem(callCtx, &dynamodb.UpdateItemInput{
 			TableName: aws.String(l.input.Table.Name), Key: l.input.Table.key(l.input.Key),
 			UpdateExpression:          aws.String(update),
-			ConditionExpression:       aws.String("#owner = :owner AND #expires > :now"),
+			ConditionExpression:       aws.String("#owner = :owner AND #expires > :now AND " + revisionCondition),
 			ExpressionAttributeNames:  names,
 			ExpressionAttributeValues: values,
 		}, noSDKRetry)
 		if err == nil {
 			l.raw, l.visible = next, payload
+			l.revision.version++
 			if commit {
 				l.complete()
 			}
@@ -425,15 +433,16 @@ func (l *Lease[T]) Release(ctx context.Context) error {
 
 // Projections come from the merged stored payload, including fields hidden from T.
 // No second write can expose an index entry inconsistent with its document.
-func (l *Lease[T]) payloadExpression(next *types.AttributeValueMemberM, commit bool) (string, map[string]string, map[string]types.AttributeValue) {
+func payloadExpression(table Table, next *types.AttributeValueMemberM, finish bool, version uint64) (string, map[string]string, map[string]types.AttributeValue) {
 	names := map[string]string{"#owner": "owner_token", "#expires": "expires_at", "#data": "data"}
-	values := map[string]types.AttributeValue{":owner": &types.AttributeValueMemberS{Value: l.owner}, ":now": number(time.Now().UnixNano()), ":data": next}
-	sets := []string{"#data = :data"}
+	values := map[string]types.AttributeValue{":data": next, ":newVersion": versionNumber(version)}
+	names["#version"], names["#generation"] = "version", "generation"
+	sets := []string{"#data = :data", "#generation = :generation", "#version = :newVersion"}
 	var removes []string
-	if commit {
+	if finish {
 		removes = append(removes, "#owner", "#expires")
 	}
-	for i, name := range l.input.Table.Attributes {
+	for i, name := range table.Attributes {
 		alias := fmt.Sprintf("#attr%d", i)
 		names[alias] = name
 		if value, ok := next.Value[name]; ok {
@@ -473,11 +482,14 @@ func (l *Lease[T]) Delete(ctx context.Context) error {
 		if err := callCtx.Err(); err != nil {
 			return err
 		}
+		names := map[string]string{"#owner": "owner_token", "#expires": "expires_at"}
+		values := map[string]types.AttributeValue{":owner": &types.AttributeValueMemberS{Value: l.owner}, ":now": number(time.Now().UnixNano())}
+		l.revision.fence(names, values)
 		_, err := l.client.DeleteItem(callCtx, &dynamodb.DeleteItemInput{
 			TableName: aws.String(l.input.Table.Name), Key: l.input.Table.key(l.input.Key),
-			ConditionExpression:       aws.String("#owner = :owner AND #expires > :now"),
-			ExpressionAttributeNames:  map[string]string{"#owner": "owner_token", "#expires": "expires_at"},
-			ExpressionAttributeValues: map[string]types.AttributeValue{":owner": &types.AttributeValueMemberS{Value: l.owner}, ":now": number(time.Now().UnixNano())},
+			ConditionExpression:       aws.String("#owner = :owner AND #expires > :now AND " + revisionCondition),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
 		}, noSDKRetry)
 		if err == nil {
 			l.complete()

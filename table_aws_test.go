@@ -31,7 +31,7 @@ func TestTableAWS(t *testing.T) {
 		TTL     int64  `dynamodbav:"ttl,omitempty"`
 	}
 	input := func(key Key) *LockInput {
-		return &LockInput{Table: table, Key: key, HeartbeatMaxAge: 30 * time.Second, HeartbeatInterval: time.Second}
+		return &LockInput{Table: table, Key: key, LeaseDuration: 30 * time.Second}
 	}
 	for _, sort := range []string{"a", "b", "c"} {
 		key := Key{Partition: "account", Sort: sort}

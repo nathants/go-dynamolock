@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 func TestLeaseAdditiveAWS(t *testing.T) {
@@ -118,6 +119,8 @@ func TestLeaseOpaqueListAWS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	expected["generation"] = &types.AttributeValueMemberS{Value: lease.revision.generation}
+	expected["version"] = versionNumber(lease.revision.version)
 	actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, input.Key)
 	if err != nil || !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("opaque list or ownership changed: %#v %v", actual, err)
@@ -151,6 +154,8 @@ func TestLeaseEmptyMapAWS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	expected["generation"] = &types.AttributeValueMemberS{Value: lease.revision.generation}
+	expected["version"] = versionNumber(lease.revision.version)
 	actual, err := getItem(t.Context(), client, Table{Name: table, PartitionKey: "id"}, input.Key)
 	if err != nil || !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("explicit map deletion or initialization changed: %#v %v", actual, err)

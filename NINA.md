@@ -8,7 +8,8 @@ guidance here and implementation rationale beside the relevant code.
 ## Layout
 
 - `dynamolock.go`: acquisition, reads, and shared request/retry helpers.
-- `lease.go`: lease state, lifetime, renewal, and payload operations.
+- `lease.go`: lease state, lifetime, renewal, and shared payload expressions.
+- `cas.go`, `revision.go`: optimistic handles, lazy initialization and shared revisions.
 - `codec.go`, `table.go`: envelope encoding, primary keys and schema validation.
 - `discovery.go`, `index_discovery.go`: typed one-page document/index discovery using SDK read options.
 - `payload.go`, `projection.go`: field-preserving merging and SDK field-name mapping.
@@ -20,7 +21,8 @@ guidance here and implementation rationale beside the relevant code.
 
 - One item per string partition key (default `id`), optionally with a string sort
   key. Primary keys, `owner_token`, `expires_at`, `data` and projected attributes
-  live outside the payload. Ownership fields are present together. Unknown outer
+  live outside the payload. `generation` and `version` are reserved outer metadata.
+  Ownership and revision fields are each present as pairs. Unknown outer
   attributes require a real `data` envelope; there is no flat-record fallback.
 - Identity is stored only outside `data`, injected on decode, and validated and
   removed on encode, including case aliases recognized by the SDK. Encoding and
@@ -41,6 +43,22 @@ guidance here and implementation rationale beside the relevant code.
   fields hidden by typed decoding; missing configured fields remove projections.
   Advance raw/visible snapshots only after confirmed writes. Release preserves the raw
   payload and is conditional only on this handle's token, even after loss.
+- All mutations participate in the shared revision protocol. Generation is a random
+  string retained until hard deletion; uint64 version starts at 1 and advances on
+  acquisition and payload writes, never heartbeat/release. Reject overflow.
+  Lease and CAS writes share field-preserving merging and projections. CAS checks
+  generation/version and lease availability atomically, clearing expired ownership.
+- ReadCAS defaults to eventual reads; observed live leases return data plus
+  ErrLockHeld and no handle. Handles serialize operations, advance snapshots only
+  on confirmed success, and become unusable on conflict, ambiguity or deletion.
+  Absent snapshots create only under physical absence. No application-work retries.
+- Existing unversioned records initialize lazily after old writers are drained.
+  Acquisition initializes in its normal write. CAS initialization is a conditional
+  metadata-only write; its returned payload (or a competing operation's failure
+  image), never the preceding stale read, establishes the revision baseline.
+  Both revision fields absent permits initialization; partial/malformed pairs fail.
+  Preserve one-request acquisition: DynamoDB cannot test integrality, so an invalid
+  fractional version may increment before decoding rejects it and cleans up ownership.
 - `Delete` uses the live ownership/expiry fence, joins renewal on success and
   loses the handle on an ambiguous result. It never blindly retries ambiguity.
 - Non-locking reads default to eventual consistency; callers opt into strong
@@ -57,7 +75,9 @@ guidance here and implementation rationale beside the relevant code.
   attributes or counts; never fetch parent documents or infer payload absence.
 - `RequireExisting` checks item existence at acquisition, not payload presence
   or a generation of the key. It does not detect deletion followed by recreation.
-- The holder establishes expiry in Unix nanoseconds. Takeover requires
+- Callers configure only `LeaseDuration`; renewal is due at one quarter of that
+  duration from the last confirmed request's start, with no interval override.
+  The holder establishes expiry in Unix nanoseconds. Takeover requires
   `expires_at < now`; renewal and payload writes require `expires_at > now`.
   Renewal cannot decrease persisted expiry, and unconfirmed attempts cannot
   extend the local monotonic deadline. Expiry permits takeover, never TTL deletion.

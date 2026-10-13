@@ -29,7 +29,7 @@ func (t Table) normalized() (Table, error) {
 	if t.PartitionKey == "" {
 		t.PartitionKey = "id"
 	}
-	names := []string{"data", "owner_token", "expires_at"}
+	names := []string{"data", "owner_token", "expires_at", "generation", "version"}
 	configured := []string{t.PartitionKey}
 	if t.SortKey != "" {
 		configured = append(configured, t.SortKey)

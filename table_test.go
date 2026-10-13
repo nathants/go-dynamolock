@@ -51,9 +51,31 @@ func TestSchemaValidation(t *testing.T) {
 		t.Error("invalid request reached provider")
 		return 400, rejectedJSON, nil
 	})
-	for _, table := range []Table{{}, {Name: "table", PartitionKey: "data"}, {Name: "table", SortKey: "ID"}, {Name: "table", Attributes: []string{"expires_at"}}, {Name: "table", Attributes: []string{""}}, {Name: "table", Attributes: []string{"x", "X"}}} {
-		if _, err := Read[struct{}](t.Context(), client, table, Key{Partition: "key"}, ReadOptions{}); err == nil {
-			t.Fatalf("accepted schema %+v", table)
+	tables := []Table{{}, {Name: "table", PartitionKey: "data"}, {Name: "table", SortKey: "ID"}, {Name: "table", Attributes: []string{"expires_at"}}, {Name: "table", Attributes: []string{""}}, {Name: "table", Attributes: []string{"x", "X"}}}
+	for _, name := range []string{"generation", "GeNeRaTiOn", "version", "VeRsIoN"} {
+		tables = append(tables,
+			Table{Name: "table", PartitionKey: name},
+			Table{Name: "table", SortKey: name},
+			Table{Name: "table", Attributes: []string{name}},
+		)
+	}
+	for _, table := range tables {
+		key := Key{Partition: "key"}
+		if table.SortKey != "" {
+			key.Sort = "sort" // A missing sort value must not mask an invalid schema.
+		}
+		if _, err := Read[struct{}](t.Context(), client, table, key, ReadOptions{}); err == nil {
+			t.Fatalf("Read accepted schema %+v", table)
+		}
+		if _, _, err := ReadCAS[struct{}](t.Context(), client, table, key, ReadOptions{}); err == nil {
+			t.Fatalf("ReadCAS accepted schema %+v", table)
+		}
+		in := protocolInput()
+		in.Table, in.Key = table, key
+		l, _, err := Lock[struct{}](t.Context(), client, in)
+		cleanupLease(t, l)
+		if err == nil {
+			t.Fatalf("Lock accepted schema %+v", table)
 		}
 	}
 	for _, key := range []Key{{}, {Partition: "key", Sort: "unexpected"}} {
