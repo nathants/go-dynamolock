@@ -30,6 +30,27 @@ type CAS[T any] struct {
 	visible  *types.AttributeValueMemberM
 }
 
+// Create writes data only if the item is physically absent, without reading or
+// acquiring a lease. Existing items cause ErrConflict, including those without
+// payload or with expired ownership. Encoding, projections and revisions use the
+// same path as CAS.Update. ErrOutcomeUnknown means creation may have succeeded;
+// reconcile the stored record before retrying.
+func Create[T any](ctx context.Context, client *dynamodb.Client, table Table, key Key, data *T) error {
+	var err error
+	table, err = table.normalized()
+	if err != nil {
+		return err
+	}
+	if err := validateTarget(ctx, client, table, key); err != nil {
+		return err
+	}
+	if err := validateType[T](); err != nil {
+		return err
+	}
+	writer := &CAS[T]{client: client, table: table, key: key, op: make(chan struct{}, 1)}
+	return writer.Update(ctx, data)
+}
+
 // ReadCAS reads a complete snapshot and returns its optimistic writer and value.
 // Reads default to eventual consistency. An observed live lease returns the
 // inspectable value and ErrLockHeld, but no writer. Every write independently

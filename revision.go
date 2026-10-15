@@ -9,8 +9,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
-// ErrConflict means a CAS snapshot no longer authorizes writes. ReadCAS must be
-// called again before recomputing and retrying application work.
+// ErrConflict means Create found an existing item or a CAS snapshot no longer
+// authorizes writes. Read the current record before deciding whether to retry;
+// CAS callers must obtain a new snapshot before recomputing application work.
 var ErrConflict = errors.New("CAS snapshot conflicts with current record")
 
 // ErrVersionExhausted means the generation's counter cannot be incremented.

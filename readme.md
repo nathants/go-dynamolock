@@ -18,7 +18,8 @@ background heartbeat extends the lease while it is held.
 `Release` releases the lock without changing data. `Delete` removes the item under
 the live lease. `Read` reads without locking, including data published by `Update`.
 Read consistency is configurable; see [Read consistency and cost](#read-consistency-and-cost).
-`ReadCAS` provides an alternative optimistic writer without leases or heartbeats;
+`ReadCAS` provides an alternative optimistic writer without leases or heartbeats.
+`Create` conditionally writes a new item without a preliminary read;
 see [Optimistic writes (CAS)](#optimistic-writes-cas).
 
 Set `Retries` to the number of additional acquisition attempts on contention.
@@ -133,6 +134,34 @@ CAS is useful when conflicts are uncommon and recomputation is cheap. Work befor
 publication must tolerate losing the race; irreversible external effects need
 independent idempotency or fencing. Choosing CAS versus a lease is the caller's
 responsibility. Neither mechanism makes multiple records or external effects atomic.
+
+### Create without a read
+
+Use `Create` when the required prior state is physical absence. It uses the
+existing CAS creation path without a preliminary read or lease, and returns an
+error rather than a writer handle:
+
+```go
+func create(ctx context.Context, client *dynamodb.Client) error {
+    return dynamolock.Create(ctx, client,
+        dynamolock.Table{Name: "table"}, dynamolock.Key{Partition: "new-item"},
+        &Data{Value: "initial"})
+}
+```
+
+Successful creation normally costs one conditional write. It stores the same
+payload envelope and configured projections as other writers, with a fresh
+random generation and version 1. Subsequent changes use `ReadCAS` or `Lock`.
+
+Any existing item causes `ErrConflict`, even if its payload is absent or identical,
+its lease has expired, or its metadata is unversioned or malformed. The existing
+item is left unchanged. On conflict, the caller can read and validate the retained
+value according to its own identity and content rules. Duplicate-heavy callers may
+prefer reading first instead of paying for a failed conditional write and a read.
+
+`ErrOutcomeUnknown` means creation may have succeeded; reconcile before retrying.
+As with other CAS mutations, only definite transient rejections are retried
+internally. Ambiguous writes are never blindly replayed.
 
 ### Shared revisions and existing tables
 
